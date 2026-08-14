@@ -1,0 +1,178 @@
+@import "tailwindcss";
+@import "tw-animate-css";
+
+@custom-variant dark (&:is(.dark *));
+
+@theme {
+  --font-sans: "Geist", "IBM Plex Sans", ui-sans-serif, system-ui, sans-serif;
+  --font-mono: "Geist Mono", "IBM Plex Mono", ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+
+  --color-bg: var(--bg);
+  --color-bg-elevated: var(--bg-elevated);
+  --color-bg-subtle: var(--bg-subtle);
+  --color-fg: var(--fg);
+  --color-fg-muted: var(--fg-muted);
+  --color-fg-subtle: var(--fg-subtle);
+  --color-border: var(--border);
+  --color-border-strong: var(--border-strong);
+  --color-accent: var(--accent);
+  --color-accent-fg: var(--accent-fg);
+  --color-ring: var(--ring);
+  --color-danger: var(--danger);
+
+  --color-seat-grok: var(--seat-grok);
+  --color-seat-grok-fg: var(--seat-grok-fg);
+  --color-seat-gpt: var(--seat-gpt);
+  --color-seat-gpt-fg: var(--seat-gpt-fg);
+  --color-seat-claude: var(--seat-claude);
+  --color-seat-claude-fg: var(--seat-claude-fg);
+  --color-seat-gemini: var(--seat-gemini);
+  --color-seat-gemini-fg: var(--seat-gemini-fg);
+  --color-seat-deepseek: var(--seat-deepseek);
+  --color-seat-deepseek-fg: var(--seat-deepseek-fg);
+  --color-seat-kimi: var(--seat-kimi);
+  --color-seat-kimi-fg: var(--seat-kimi-fg);
+  --color-seat-minimax: var(--seat-minimax);
+  --color-seat-minimax-fg: var(--seat-minimax-fg);
+
+  --radius-xs: 4px;
+  --radius-sm: 8px;
+  --radius-md: 12px;
+  --radius-lg: 16px;
+  --radius-xl: 24px;
+
+  --shadow-composer: var(--shadow-composer);
+}
+
+:root {
+  --bg: #f5f5f5;
+  --bg-elevated: #ffffff;
+  --bg-subtle: #ececec;
+  --fg: #111111;
+  --fg-muted: #5c5c5c;
+  --fg-subtle: #8a8a8a;
+  --border: color-mix(in oklab, #111111 9%, transparent);
+  --border-strong: color-mix(in oklab, #111111 16%, transparent);
+  --accent: #1677ff;
+  --accent-fg: #ffffff;
+  --ring: color-mix(in oklab, #1677ff 45%, transparent);
+  --danger: #cf1322;
+  --shadow-composer: 0 8px 28px color-mix(in oklab, #111111 8%, transparent);
+
+  --seat-grok: #111111;
+  --seat-grok-fg: #f5f5f5;
+  --seat-gpt: #0f766e;
+  --seat-gpt-fg: #f0fdfa;
+  --seat-claude: #c2410c;
+  --seat-claude-fg: #fff7ed;
+  --seat-gemini: #1d4ed8;
+  --seat-gemini-fg: #eff6ff;
+  --seat-deepseek: #334155;
+  --seat-deepseek-fg: #f8fafc;
+  --seat-kimi: #44403c;
+  --seat-kimi-fg: #fafaf9;
+  --seat-minimax: #3f6212;
+  --seat-minimax-fg: #f7fee7;
+}
+
+.dark {
+  --bg: #000000;
+  --bg-elevated: #141414;
+  --bg-subtle: #1f1f1f;
+  --fg: #ececec;
+  --fg-muted: #a0a0a0;
+  --fg-subtle: #737373;
+  --border: color-mix(in oklab, #ffffff 10%, transparent);
+  --border-strong: color-mix(in oklab, #ffffff 16%, transparent);
+  --accent: #1677ff;
+  --accent-fg: #ffffff;
+  --ring: color-mix(in oklab, #1677ff 50%, transparent);
+  --danger: #ff7875;
+  --shadow-composer: 0 12px 40px rgb(0 0 0 / 0.45);
+
+  --seat-grok: #e5e5e5;
+  --seat-grok-fg: #111111;
+  --seat-gpt: #2dd4bf;
+  --seat-gpt-fg: #042f2e;
+  --seat-claude: #fdba74;
+  --seat-claude-fg: #431407;
+  --seat-gemini: #93c5fd;
+  --seat-gemini-fg: #172554;
+  --seat-deepseek: #94a3b8;
+  --seat-deepseek-fg: #0f172a;
+  --seat-kimi: #d6d3d1;
+  --seat-kimi-fg: #1c1917;
+  --seat-minimax: #bef264;
+  --seat-minimax-fg: #1a2e05;
+}
+
+@layer base {
+  html {
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
+  }
+
+  * {
+    border-color: var(--border);
+  }
+
+  html,
+  body,
+  #app {
+    min-height: 100%;
+  }
+
+  body {
+    background: var(--bg);
+    color: var(--fg);
+    font-family: var(--font-sans);
+    font-size: 15px;
+    line-height: 1.55;
+  }
+
+  button:not(:disabled),
+  [role="button"]:not(:disabled) {
+    cursor: pointer;
+  }
+
+  h1,
+  h2,
+  h3 {
+    text-wrap: balance;
+  }
+
+  p {
+    text-wrap: pretty;
+  }
+
+  ::selection {
+    background: color-mix(in oklab, var(--accent) 28%, transparent);
+  }
+}
+
+@keyframes lumen-dots {
+  0%,
+  80%,
+  100% {
+    opacity: 0.25;
+    transform: translateY(0);
+  }
+  40% {
+    opacity: 1;
+    transform: translateY(-2px);
+  }
+}
+
+.lumen-dot {
+  animation: lumen-dots 1s ease-in-out infinite;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+  }
+}
