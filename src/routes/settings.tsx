@@ -33,7 +33,9 @@ function SettingsPage() {
           <p className="mt-2 max-w-lg text-sm leading-relaxed text-fg-muted">
             Sign-in is the vault. Keys we save here live on this account — not this tab. Come back, sign in, they are
             still here. Codex can use ChatGPT. Claude Agent takes a{" "}
-            <span className="font-mono text-xs">claude setup-token</span>. Everyone else is an API key.
+            <span className="font-mono text-xs">claude setup-token</span>. Everyone else is an API key. When Legion
+            runs on a machine with the <span className="font-mono text-xs">claude</span> or{" "}
+            <span className="font-mono text-xs">codex</span> CLI signed in, those seats use it and need no key at all.
           </p>
           <div className="mt-6">
             <AssistantsPanel />

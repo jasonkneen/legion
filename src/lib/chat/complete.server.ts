@@ -1,6 +1,7 @@
 import { PROVIDER_BY_ID, type ProviderId } from "@/lib/providers";
-import { resolveCreds, updateAccessToken, type ResolvedCreds } from "./keys.server";
+import { localCliFor, resolveCreds, updateAccessToken, type ResolvedCreds } from "./keys.server";
 import { isClaudeOAuthToken, refreshCodexTokens } from "./oauth.server";
+import { completeWithClaudeCli, completeWithCodexCli } from "./local-cli.server";
 import type { ProviderMessage } from "./xai.server";
 
 export type CompleteOpts = {
@@ -30,7 +31,11 @@ export async function completeForProvider(
 
   try {
     const text = await dispatch(userId, creds, messages, opts);
-    return { ok: true, text: text.trim(), model: creds.model, provider };
+    // A local CLI with no model pinned in Settings answers on its own default,
+    // which this process never learns the name of.
+    const model =
+      creds.model || (creds.authKind === "local_cli" ? `${localCliFor(provider) ?? "local"} CLI default` : creds.model);
+    return { ok: true, text: text.trim(), model, provider };
   } catch (err) {
     return { ok: false, error: friendlyError(err, def.name) };
   }
@@ -43,6 +48,12 @@ async function dispatch(
   opts: CompleteOpts,
 ): Promise<string> {
   const def = PROVIDER_BY_ID[creds.provider];
+  if (creds.authKind === "local_cli") {
+    // No key anywhere — a CLI on this machine is signed in and answers instead.
+    return creds.provider === "codex"
+      ? completeWithCodexCli(messages, creds.model)
+      : completeWithClaudeCli(messages, creds.model);
+  }
   if (def.kind === "codex" || (creds.provider === "codex" && creds.authKind === "oauth")) {
     return completeCodex(userId, creds, messages, opts);
   }

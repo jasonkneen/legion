@@ -113,18 +113,20 @@ const explicitBaseURL = env("BETTER_AUTH_URL");
 // Explicit `string[]` (not a readonly tuple) — Better Auth's DynamicBaseURLConfig
 // requires a mutable `allowedHosts: string[]`.
 const previewAllowedHosts: string[] = [...PREVIEW_ALLOWED_HOSTS];
-// Local `npm run dev` (port 8080 contract). Browsers may send Origin as any of
-// these for the same server — trusting only `localhost` rejects `127.0.0.1` and
-// breaks email/password with "Invalid origin".
-const LOCAL_DEV_ORIGINS: string[] = [
-  "http://localhost:8080",
-  "http://127.0.0.1:8080",
-  "http://[::1]:8080",
-];
+// Local `npm run dev`. Browsers may send Origin as any of these for the same
+// server — trusting only `localhost` rejects `127.0.0.1` and breaks
+// email/password with "Invalid origin". The port is wildcarded because 8080 is
+// only the default: a clone that already has 8080 in use runs on another port,
+// and pinning the port there rejects every credentialed auth POST.
+const LOCAL_DEV_HOSTS: string[] = ["localhost:*", "127.0.0.1:*", "[::1]:*"];
+const LOCAL_DEV_ORIGINS: string[] = LOCAL_DEV_HOSTS.map((host) => `http://${host}`);
 const baseURL = explicitBaseURL ?? {
   // Include loopback hosts so dynamic baseURL resolves for local email/password
   // (not only the preview wildcard).
-  allowedHosts: [...previewAllowedHosts, "localhost", "127.0.0.1", "[::1]"],
+  // Host patterns are matched against host:port, so the bare names only cover
+  // the default port — the `:*` variants keep any local dev port resolving to
+  // its own origin instead of silently falling back to :8080.
+  allowedHosts: [...previewAllowedHosts, ...LOCAL_DEV_HOSTS, "localhost", "127.0.0.1", "[::1]"],
   // `auto` → trust both http:// and https:// expansions of allowedHosts
   // (preview is https; local dev is http).
   protocol: "auto" as const,

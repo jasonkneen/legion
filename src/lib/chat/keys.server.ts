@@ -8,13 +8,30 @@ import {
   type ProviderStatus,
 } from "@/lib/providers";
 import { isClaudeOAuthToken, type CodexTokens } from "./oauth.server";
+import { detectLocalCli, type LocalCliId } from "./local-cli.server";
+
+/**
+ * Providers that can be served by a signed-in CLI on this machine when no key
+ * or OAuth token is configured. See `local-cli.server.ts`.
+ */
+const LOCAL_CLI_FOR: Partial<Record<ProviderId, LocalCliId>> = {
+  anthropic: "claude",
+  codex: "codex",
+};
+
+/** The local CLI backing this provider, if it is installed. */
+export function localCliFor(provider: ProviderId): LocalCliId | null {
+  const cli = LOCAL_CLI_FOR[provider];
+  if (!cli) return null;
+  return detectLocalCli(cli) ? cli : null;
+}
 
 export type ResolvedCreds = {
   provider: ProviderId;
   apiKey: string;
   model: string;
   fromEnv: boolean;
-  authKind: "api_key" | "oauth";
+  authKind: "api_key" | "oauth" | "local_cli";
   refreshToken: string | null;
   accountId: string | null;
   expiresAt: number | null;
@@ -58,7 +75,10 @@ export async function listStatuses(userId: string): Promise<ProviderStatus[]> {
   return PROVIDERS.map((p) => {
     const row = stored.get(p.id);
     const fallback = envKey(p.envVar);
-    const configured = Boolean(row?.apiKey || fallback || p.id === "ollama");
+    // A signed-in local CLI counts as configured — the seat can speak without
+    // anyone pasting anything — but only while nothing explicit is set.
+    const localCli = !row?.apiKey && !fallback ? localCliFor(p.id) : null;
+    const configured = Boolean(row?.apiKey || fallback || localCli || p.id === "ollama");
     return {
       id: p.id,
       name: p.name,
@@ -75,12 +95,14 @@ export async function listStatuses(userId: string): Promise<ProviderStatus[]> {
           : keyHint(row.apiKey)
         : fallback
           ? "workspace key"
-          : p.id === "ollama"
-            ? "local, no key"
-            : null,
+          : localCli
+            ? `local ${localCli} CLI`
+            : p.id === "ollama"
+              ? "local, no key"
+              : null,
       fromEnv: !row?.apiKey && Boolean(fallback),
       auth: p.auth,
-      authKind: row?.authKind ?? null,
+      authKind: row?.authKind ?? (localCli ? "local_cli" : null),
       accountId: row?.accountId ?? null,
       featured: Boolean(p.featured),
     };
@@ -93,7 +115,28 @@ export async function resolveCreds(userId: string, provider: ProviderId): Promis
   const row = stored.get(provider);
   const fallback = envKey(def.envVar);
   const apiKey = row?.apiKey || fallback || (provider === "ollama" ? "ollama" : "");
-  if (!apiKey) return null;
+  if (!apiKey) {
+    // Nothing pasted and nothing in the environment: fall back to a CLI that is
+    // already signed in on this machine. The CLI owns its own credential, so
+    // there is no key to carry here.
+    if (localCliFor(provider)) {
+      return {
+        provider,
+        // Empty means "whatever the CLI is configured to use". The provider's
+        // default model id is an API-catalog name and is not necessarily valid
+        // for a CLI on a subscription login (e.g. a ChatGPT account cannot run
+        // `gpt-5.6-codex`), so only an explicit choice in Settings is passed on.
+        model: (row?.model ?? "").trim(),
+        apiKey: "",
+        fromEnv: false,
+        authKind: "local_cli",
+        refreshToken: null,
+        accountId: null,
+        expiresAt: null,
+      };
+    }
+    return null;
+  }
   return {
     provider,
     apiKey,

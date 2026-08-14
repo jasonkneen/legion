@@ -285,7 +285,7 @@ export type ProviderStatus = {
   hint: string | null;
   fromEnv: boolean;
   auth: ProviderAuth;
-  authKind: "api_key" | "oauth" | null;
+  authKind: "api_key" | "oauth" | "local_cli" | null;
   accountId: string | null;
   featured: boolean;
 };

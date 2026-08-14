@@ -109,6 +109,82 @@ function createNeonSql(): Promise<Sql> {
   return globalRef.__pgSqlPromise__;
 }
 
+/**
+ * Refuse to open a data directory another live process is already using.
+ *
+ * PGLite writes a `postmaster.pid` but does not enforce it: two processes will
+ * both open the same directory, both accept writes, and silently lose some of
+ * them — measured at 10 of 41 rows in a two-process test — with the directory
+ * eventually failing to open at all ("could not locate a valid checkpoint
+ * record"), which needs `pg_resetwal` to recover. A second dev server on the
+ * same `.data` is an easy accident, so take a real lock keyed to an OS pid we
+ * can test for liveness.
+ *
+ * Not a cross-machine lock: it assumes the lock file and the process share a
+ * host, which holds for a local `.data` directory.
+ */
+async function claimPgliteDir(dir: string): Promise<void> {
+  const { readFileSync, writeFileSync, unlinkSync } = await import("node:fs");
+  const lockPath = `${dir}.lock`;
+
+  try {
+    const holder = Number.parseInt(readFileSync(lockPath, "utf8").trim(), 10);
+    if (Number.isInteger(holder) && holder > 0 && holder !== process.pid) {
+      let alive = true;
+      try {
+        process.kill(holder, 0); // Signal 0 tests for existence, sends nothing.
+      } catch {
+        alive = false; // Killed without cleanup — the lock is stale, take it.
+      }
+      if (alive) {
+        throw new Error(
+          [
+            `Another process (pid ${holder}) is already using ${dir}.`,
+            "Embedded Postgres allows one process per data directory; a second one",
+            "loses writes and can corrupt it. Stop that server, or start this one",
+            "with DATA_DIR set to a different path.",
+          ].join("\n"),
+        );
+      }
+    }
+  } catch (err) {
+    // A missing lock file is the normal case; anything else propagates.
+    if (err instanceof Error && !/ENOENT/.test(err.message)) throw err;
+  }
+
+  writeFileSync(lockPath, String(process.pid), "utf8");
+  // Best-effort release. A hard kill skips this, which is why the read path
+  // above tests the recorded pid for liveness rather than trusting the file.
+  process.once("exit", () => {
+    try {
+      unlinkSync(lockPath);
+    } catch {
+      // Already gone, or someone else's now — nothing useful to do at exit.
+    }
+  });
+}
+
+/**
+ * PGLite reports every startup failure as a bare `Aborted()` from the WASM
+ * runtime — the actual Postgres log line is only visible with `{ debug: 1 }`.
+ * Name the usual causes rather than making the next person turn on debug
+ * logging to find out.
+ */
+function pgliteStartupHelp(dir: string, err: unknown): string {
+  const detail = err instanceof Error ? err.message : String(err);
+  return [
+    `PGLite could not open ${dir} (${detail}).`,
+    "Two usual causes:",
+    `  1. A previous run was killed and left ${dir}/postmaster.pid behind. Delete`,
+    `     that file and start again.`,
+    `  2. The write-ahead log is torn ("could not locate a valid checkpoint`,
+    `     record"), usually after two processes shared the directory. Recover with`,
+    `     \`pg_resetwal -f ${dir}\` from a matching Postgres version, after taking a`,
+    `     copy of the directory.`,
+    "Re-run with the PGLite debug option to see the Postgres log if neither fits.",
+  ].join("\n");
+}
+
 async function createPgliteSql(): Promise<Sql> {
   // Embedded Postgres, imported on demand so it never loads on the Neon path.
   // Persisted under <cwd>/.data/pglite so keys and sessions survive restarts.
@@ -116,6 +192,7 @@ async function createPgliteSql(): Promise<Sql> {
     const { mkdirSync } = await import("node:fs");
     const pgliteDir = `${dataDir()}/pglite`;
     mkdirSync(pgliteDir, { recursive: true });
+    await claimPgliteDir(pgliteDir);
     const { PGlite } = await import("@electric-sql/pglite");
     const pg = new PGlite(pgliteDir, {
       parsers: {
@@ -124,7 +201,11 @@ async function createPgliteSql(): Promise<Sql> {
         [OID_INTERVAL]: identity,
       },
     });
-    await pg.waitReady;
+    try {
+      await pg.waitReady;
+    } catch (err) {
+      throw new Error(pgliteStartupHelp(pgliteDir, err), { cause: err });
+    }
     await pg.exec(
       "create table if not exists _migrations (name text primary key, applied_at timestamptz not null default now())",
     );
