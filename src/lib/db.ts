@@ -1,3 +1,5 @@
+import { dataDir } from "./data-dir";
+
 /** Which database backend is active. */
 export type DbSource = "neon" | "pglite";
 
@@ -14,7 +16,7 @@ const databaseUrl =
  * the app has a working database even with nothing configured — the live preview
  * included. Swap in Neon later by just setting `DATABASE_URL`; no code changes.
  *
- * Preview PGLite is written to `/workspace/.data/pglite` so accounts, sessions,
+ * Preview PGLite is written to `<cwd>/.data/pglite` so accounts, sessions,
  * and provider keys survive process restarts. In-memory would wipe keys on every
  * revive — which made sign-in pointless.
  */
@@ -109,13 +111,13 @@ function createNeonSql(): Promise<Sql> {
 
 async function createPgliteSql(): Promise<Sql> {
   // Embedded Postgres, imported on demand so it never loads on the Neon path.
-  // Persisted under /workspace/.data/pglite so keys and sessions survive restarts.
+  // Persisted under <cwd>/.data/pglite so keys and sessions survive restarts.
   globalRef.__pgliteInstance__ ??= (async () => {
     const { mkdirSync } = await import("node:fs");
-    const dataDir = "/workspace/.data/pglite";
-    mkdirSync(dataDir, { recursive: true });
+    const pgliteDir = `${dataDir()}/pglite`;
+    mkdirSync(pgliteDir, { recursive: true });
     const { PGlite } = await import("@electric-sql/pglite");
-    const pg = new PGlite(dataDir, {
+    const pg = new PGlite(pgliteDir, {
       parsers: {
         [OID_INT8]: Number,
         [OID_DATE]: identity,

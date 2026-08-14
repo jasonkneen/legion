@@ -36,6 +36,7 @@ import { randomBytes } from "node:crypto";
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { Pool } from "pg";
 import { ensureDbReady, getPglite } from "../db";
+import { dataDir } from "../data-dir";
 import { emailAndPasswordEnabled } from "./email-password";
 import { GROK_PROVIDERS } from "./providers";
 import { pgliteDialect } from "./pglite-dialect";
@@ -59,9 +60,10 @@ const globalAuthRef = globalThis as typeof globalThis & {
 };
 function previewAuthSecret(): string {
   if (globalAuthRef.__grokAuthPreviewSecret__) return globalAuthRef.__grokAuthPreviewSecret__;
-  const path = "/workspace/.data/auth-secret";
+  const dir = dataDir();
+  const path = `${dir}/auth-secret`;
   try {
-    mkdirSync("/workspace/.data", { recursive: true });
+    mkdirSync(dir, { recursive: true });
     if (existsSync(path)) {
       const existing = readFileSync(path, "utf8").trim();
       if (existing.length >= 32) {
