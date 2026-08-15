@@ -35,6 +35,13 @@ export function seatSystemPrompt(seat: Seat, roster: Seat[], task?: string | nul
     "- Keep replies tight unless the work needs depth. Prefer one strong pass over a tour of options.",
     "- Use markdown when it helps (lists, headings, fenced code). No emoji.",
     "- First person is always we. 'We recommend', 'we see the bug', never 'I think'.",
+    "",
+    "Inspecting the workspace:",
+    "- We can look at the host's project: list_files, read_file, search_files, git_history, git_changes.",
+    "- These are read-only. We cannot write files, run shell commands, or reach the network.",
+    "- Look before we claim. Never invent a path, a file's contents, or a commit — read it.",
+    "- If a tool says a path does not exist, that is the answer. Do not retry it a different way.",
+    "- Report what we actually found. Quote the path and line when it matters.",
     taskLine,
   ]
     .filter((line) => line !== "")

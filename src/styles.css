@@ -122,6 +122,24 @@
     min-height: 100%;
   }
 
+  /*
+   * The app shell is sized with `h-dvh`. A browser that does not understand the
+   * `dvh` unit drops the declaration entirely, leaving the shell at content
+   * height: it stops short of the window bottom, and once the thread is long
+   * enough the whole document scrolls instead of the message list. Fall back to
+   * `vh` only where `dvh` is genuinely missing, so modern browsers are
+   * untouched (`vh` is the one that misbehaves on mobile URL-bar show/hide).
+   */
+  @supports not (height: 100dvh) {
+    .h-dvh {
+      height: 100vh;
+    }
+
+    .min-h-dvh {
+      min-height: 100vh;
+    }
+  }
+
   body {
     background: var(--bg);
     color: var(--fg);

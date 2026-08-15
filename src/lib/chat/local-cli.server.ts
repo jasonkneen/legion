@@ -18,6 +18,7 @@ import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { accessSync, constants } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
+import { MAX_TOOL_CALLS, toolsRoot } from "./tools.server";
 import type { ProviderMessage } from "./xai.server";
 
 export type LocalCliId = "claude" | "codex";
@@ -128,11 +129,14 @@ function renderPrompt(messages: ProviderMessage[]): { system: string; prompt: st
 /**
  * One turn through the Claude Agent SDK.
  *
- * `tools: []` and `settingSources: []` keep this a plain chat seat: no file
- * access, no permission prompts to answer (there is no UI here to answer them),
- * and none of the workstation's CLAUDE.md / settings bleeding into an app
- * conversation. `maxTurns: 1` stops it from looping on its own.
+ * The seat gets Claude Code's own read-only tools — Read, Glob, Grep — so it
+ * can inspect the workspace like the API seats can. Everything that writes
+ * (Edit, Write, Bash, WebFetch) stays off: a turn fires unattended and there is
+ * no UI here to approve anything. `settingSources: []` keeps the workstation's
+ * CLAUDE.md and settings out of app conversations, and `maxTurns` bounds the
+ * tool loop the way MAX_TOOL_CALLS bounds the API ones.
  */
+const CLAUDE_READONLY_TOOLS = ["Read", "Glob", "Grep"];
 export async function completeWithClaudeCli(
   messages: ProviderMessage[],
   model: string,
@@ -152,9 +156,11 @@ export async function completeWithClaudeCli(
         ...(executable ? { pathToClaudeCodeExecutable: executable } : {}),
         ...(model ? { model } : {}),
         ...(system ? { systemPrompt: system } : {}),
-        tools: [],
+        tools: CLAUDE_READONLY_TOOLS,
+        allowedTools: CLAUDE_READONLY_TOOLS,
         settingSources: [],
-        maxTurns: 1,
+        cwd: toolsRoot(),
+        maxTurns: MAX_TOOL_CALLS,
         abortController: abort,
       },
     });
@@ -321,7 +327,7 @@ export async function completeWithCodexCli(
         });
         send({ jsonrpc: "2.0", method: "initialized" });
         const started = await request("thread/start", {
-          cwd: process.cwd(),
+          cwd: toolsRoot(),
           sandbox: "read-only",
           approvalPolicy: "never",
           ephemeral: true,

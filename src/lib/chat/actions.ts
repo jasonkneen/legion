@@ -427,6 +427,9 @@ export const generateSeatReply = createServerFn({ method: "POST" })
       [{ role: "system", content: system }, ...toProviderMessages(history, seats)],
       {
         maxTokens: data.jumpIn ? 280 : 1400,
+        // The jump-in check must answer immediately (usually "SKIP"); handing it
+        // tools would turn a cheap interjection into an inspection round.
+        tools: !data.jumpIn,
         temperature: data.task?.toLowerCase().includes("review") ? 0.4 : 0.7,
       },
     );
