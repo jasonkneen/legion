@@ -6,6 +6,11 @@ import { AddSeatDialog, type AfterSeat } from "@/components/add-seat-dialog";
 import { Composer } from "@/components/chat/composer";
 import { QueueTray, type QueuedMessage } from "@/components/chat/queue-tray";
 import { ApprovalPanel } from "@/components/chat/approval-panel";
+import { ActivityPanel } from "@/components/chat/activity-panel";
+import { TodoPanel } from "@/components/chat/todo-panel";
+import { QuestionForm } from "@/components/chat/question-form";
+import { listPendingQuestions, submitQuestionAnswers } from "@/lib/chat/question-actions";
+import type { PendingQuestion } from "@/lib/chat/questions.server";
 import { answerApproval, listPendingApprovals } from "@/lib/chat/approval-actions";
 import type { ApprovalScope, PendingApprovalView } from "@/lib/chat/approvals.server";
 import { MessageItem } from "@/components/chat/message-item";
@@ -46,6 +51,10 @@ export function ChatView({
   // Tool calls parked waiting on a decision. A parked turn holds a child
   // process open, so this is polled only while a seat is actually working.
   const [approvals, setApprovals] = useState<PendingApprovalView[]>([]);
+  // The message being replied to, so the next send is addressed at its author.
+  const [replyTo, setReplyTo] = useState<{ handle: string; excerpt: string } | null>(null);
+  // Questions a seat has parked on. Polled with the approvals, same reasoning.
+  const [questions, setQuestions] = useState<PendingQuestion[]>([]);
   const [workingHandle, setWorkingHandle] = useState<string | null>(null);
   const [status, setStatus] = useState<string | null>(null);
   const [elapsed, setElapsed] = useState(0);
@@ -111,6 +120,7 @@ export function ChatView({
   useEffect(() => {
     if (!sending) {
       setApprovals([]);
+      setQuestions([]);
       return;
     }
     let stopped = false;
@@ -118,6 +128,11 @@ export function ChatView({
       void listPendingApprovals({ data: conversationId })
         .then((rows) => {
           if (!stopped) setApprovals(rows);
+        })
+        .catch(() => undefined);
+      void listPendingQuestions({ data: conversationId })
+        .then((rows) => {
+          if (!stopped) setQuestions(rows);
         })
         .catch(() => undefined);
     };
@@ -384,6 +399,13 @@ export function ChatView({
               </div>
             ) : (
               <MessageItem
+                onReply={(m, seat) =>
+                  setReplyTo(
+                    seat
+                      ? { handle: seat.handle, excerpt: m.content.replace(/\s+/g, " ").slice(0, 80) }
+                      : null,
+                  )
+                }
                 key={message.id}
                 message={message}
                 seat={message.agentId ? seatById.get(message.agentId) : undefined}
@@ -417,6 +439,21 @@ export function ChatView({
 
       <div className="px-3 pt-1 pb-[max(1rem,env(safe-area-inset-bottom))] md:px-6">
         <div className="mx-auto max-w-2xl">
+          <TodoPanel conversationId={conversationId} live={sending} />
+          <ActivityPanel conversationId={conversationId} live={sending} />
+          {questions[0] && (
+            <QuestionForm
+              request={questions[0]}
+              onSubmit={async (answers) => {
+                setQuestions((q) => q.slice(1));
+                await submitQuestionAnswers({ data: { id: questions[0].id, answers } });
+              }}
+              onDismiss={async () => {
+                setQuestions((q) => q.slice(1));
+                await submitQuestionAnswers({ data: { id: questions[0].id, answers: null } });
+              }}
+            />
+          )}
           {approvals[0] && (
             <ApprovalPanel request={approvals[0]} onDecide={decideApprovalRequest} />
           )}
@@ -434,6 +471,8 @@ export function ChatView({
             // the composer stays live and Enter queues instead — see `submit`.
             disabled={seats.length === 0}
             queueing={sending}
+            replyTo={replyTo}
+            onClearReply={() => setReplyTo(null)}
             placeholder={
               seats.length === 0
                 ? "Seat a rank before we write"

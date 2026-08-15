@@ -22,7 +22,7 @@ import { MAX_TOOL_CALLS, toolsRoot, type ToolContext } from "./tools.server";
 import { logEvent } from "@/lib/log.server";
 import type { ProviderMessage } from "./xai.server";
 
-export type LocalCliId = "claude" | "codex" | "grok";
+export type LocalCliId = "claude" | "codex" | "grok" | "pi" | "hermes" | "qwen";
 
 /** How long a single local turn may take before the child is killed. */
 const TURN_TIMEOUT_MS = 180_000;
@@ -47,6 +47,90 @@ const ENV_OVERRIDE: Record<LocalCliId, string> = {
   claude: "CLAUDE_CLI_PATH",
   codex: "CODEX_CLI_PATH",
   grok: "GROK_CLI_PATH",
+  pi: "PI_CLI_PATH",
+  hermes: "HERMES_CLI_PATH",
+  qwen: "QWEN_CLI_PATH",
+};
+
+/**
+ * The simpler CLIs: one process, a prompt in, an answer out.
+ *
+ * Unlike Claude (an SDK with a permission callback) and Codex (a JSON-RPC
+ * protocol), these three are asked once and answer once. Each needs its own
+ * flags for "don't be interactive", "here is the system prompt" and "no tools" —
+ * tools stay off because none of them can ask before acting, and an unattended
+ * seat must not edit the workstation without a prompt the human can see.
+ */
+type SimpleCliSpec = {
+  /** Build argv for a single-shot run. */
+  args: (prompt: string, system: string, model: string) => string[];
+  /** Pull the answer out of stdout. */
+  parse: (stdout: string) => string;
+};
+
+/** Last assistant text in pi's NDJSON stream. */
+function parsePiOutput(stdout: string): string {
+  let text = "";
+  for (const line of stdout.split("\n")) {
+    if (!line.trim().startsWith("{")) continue;
+    try {
+      const row = JSON.parse(line) as {
+        type?: string;
+        message?: { role?: string; content?: { type?: string; text?: string }[] };
+      };
+      if (row.type !== "turn_end" && row.type !== "message_end") continue;
+      if (row.message?.role !== "assistant") continue;
+      const joined = (row.message.content ?? [])
+        .filter((c) => c.type === "text" && typeof c.text === "string")
+        .map((c) => c.text as string)
+        .join("");
+      if (joined.trim()) text = joined;
+    } catch {
+      // Partial or non-JSON lines are normal in a stream; skip them.
+    }
+  }
+  return text.trim();
+}
+
+const SIMPLE_CLIS: Partial<Record<LocalCliId, SimpleCliSpec>> = {
+  pi: {
+    args: (prompt, system, model) => [
+      "-p",
+      "--mode",
+      "json",
+      // No tools: pi cannot route a permission request back to us.
+      "--no-tools",
+      "--no-session",
+      ...(system ? ["--system-prompt", system] : []),
+      ...(model ? ["--model", model] : []),
+      prompt,
+    ],
+    parse: parsePiOutput,
+  },
+  hermes: {
+    args: (prompt, system, model) => [
+      "-z",
+      system ? `${system}\n\n---\n\n${prompt}` : prompt,
+      "--safe-mode",
+      ...(model ? ["-m", model] : []),
+    ],
+    // Plain text on stdout.
+    parse: (out) => out.trim(),
+  },
+  qwen: {
+    args: (prompt, system, model) => [
+      "-p",
+      system ? `${system}\n\n---\n\n${prompt}` : prompt,
+      ...(model ? ["-m", model] : []),
+    ],
+    parse: (out) =>
+      out
+        .split("\n")
+        // Qwen prefixes warnings about MCP servers it could not start.
+        .filter((l) => !/^(Warning|Loaded cached|\[dotenv)/i.test(l.trim()))
+        .join("\n")
+        .trim(),
+  },
 };
 
 /**
@@ -158,7 +242,16 @@ const CLAUDE_READONLY_TOOLS = ["Read", "Glob", "Grep"];
  * supplies a tool context, because without one there is nobody to approve them
  * and an unattended turn must not edit the workstation.
  */
-const CLAUDE_WRITE_TOOLS = ["Edit", "Write", "Bash"];
+const CLAUDE_WRITE_TOOLS = [
+  "Edit",
+  "Write",
+  "Bash",
+  // Task fans work out to subagents. It is in the gated set because a subagent
+  // inherits the seat's reach: approving one Task can mean several tool calls
+  // the human never saw individually. The activity panel shows each subagent
+  // start and finish so it is at least visible after the fact.
+  "Task",
+];
 
 export async function completeWithClaudeCli(
   messages: ProviderMessage[],
@@ -187,6 +280,11 @@ export async function completeWithClaudeCli(
         allowedTools: CLAUDE_READONLY_TOOLS,
         ...(ctx ? { canUseTool: claudeApprovalBridge(ctx) } : {}),
         settingSources: [],
+        // The user's MCP servers, handed to Claude Code directly rather than
+        // proxied: it speaks MCP natively, and its own tool loop can use them
+        // without a round trip through ours. `settingSources: []` means only
+        // these are loaded, not the workstation's own MCP config.
+        ...(ctx ? { mcpServers: await claudeMcpServers(ctx.userId) } : {}),
         cwd: toolsRoot(),
         maxTurns: MAX_TOOL_CALLS,
         abortController: abort,
@@ -194,6 +292,29 @@ export async function completeWithClaudeCli(
     });
 
     for await (const message of run) {
+      // Subagents: Claude Code can fan work out to Task subagents, which would
+      // otherwise be invisible — the seat just takes longer and comes back with
+      // more. Log each one so the activity panel can show who it delegated to.
+      if (message.type === "system" && ctx) {
+        if (message.subtype === "task_started") {
+          logEvent({
+            kind: "cli:spawn",
+            actor: `${ctx.actor}:subagent`,
+            conversationId: ctx.conversationId,
+            message: `subagent started: ${message.description}`,
+            data: { type: message.subagent_type ?? message.task_type ?? "task", id: message.task_id },
+          });
+        } else if (message.subtype === "task_notification") {
+          logEvent({
+            kind: message.status === "failed" ? "cli:exit" : "cli:exit",
+            actor: `${ctx.actor}:subagent`,
+            conversationId: ctx.conversationId,
+            message: `subagent ${message.status}: ${message.summary}`,
+            data: { id: message.task_id, tokens: message.usage?.total_tokens },
+          });
+        }
+        continue;
+      }
       if (message.type !== "result") continue;
       if (message.subtype === "success" && !message.is_error) return message.result;
       const detail =
@@ -209,6 +330,92 @@ export async function completeWithClaudeCli(
   } finally {
     clearTimeout(timer);
   }
+}
+
+/**
+ * One turn through a single-shot CLI (pi, hermes, qwen).
+ *
+ * An error here is usually "installed but not signed in" — qwen answers 401
+ * from ModelScope, for instance — so the message is passed through rather than
+ * flattened, and the seat says what the CLI said.
+ */
+export async function completeWithSimpleCli(
+  cli: LocalCliId,
+  messages: ProviderMessage[],
+  model: string,
+  ctx?: ToolContext,
+): Promise<string> {
+  const spec = SIMPLE_CLIS[cli];
+  if (!spec) throw new Error(`${cli} has no single-shot runner.`);
+  const bin = detectLocalCli(cli);
+  if (!bin) throw new Error(`The ${cli} CLI is not installed on this machine.`);
+
+  const { system, prompt } = renderPrompt(messages);
+  const started = Date.now();
+  logEvent({ kind: "cli:spawn", actor: cli, conversationId: ctx?.conversationId, message: `${cli} single-shot` });
+
+  const child = spawn(bin, spec.args(prompt, system, model), { stdio: ["ignore", "pipe", "pipe"] });
+  let stdout = "";
+  let stderr = "";
+  child.stdout.on("data", (c: Buffer) => {
+    stdout += c.toString();
+  });
+  child.stderr.on("data", (c: Buffer) => {
+    stderr = `${stderr}${c.toString()}`.slice(-2000);
+  });
+
+  const timer = setTimeout(() => child.kill(), TURN_TIMEOUT_MS);
+  const code = await new Promise<number | null>((resolveExit, reject) => {
+    child.on("error", reject);
+    child.on("close", resolveExit);
+  }).finally(() => clearTimeout(timer));
+
+  logEvent({
+    kind: "cli:exit",
+    actor: cli,
+    conversationId: ctx?.conversationId,
+    message: `${cli} exited ${code}`,
+    durationMs: Date.now() - started,
+  });
+
+  const text = spec.parse(stdout);
+  if (text) return text;
+  const detail = (stderr || stdout).trim().slice(-300);
+  throw new Error(detail ? `${cli} said: ${detail}` : `${cli} returned nothing (exit ${code}).`);
+}
+
+/**
+ * The user's MCP servers in the Agent SDK's own config shape.
+ *
+ * Claude Code connects to these itself, so its tool loop can call them without
+ * every request bouncing through Legion. A malformed entry is skipped rather
+ * than failing the turn.
+ */
+async function claudeMcpServers(
+  userId: string,
+): Promise<Record<string, import("@anthropic-ai/claude-agent-sdk").McpServerConfig>> {
+  const { listMcpServers } = await import("./mcp.server");
+  const out: Record<string, import("@anthropic-ai/claude-agent-sdk").McpServerConfig> = {};
+  for (const server of await listMcpServers(userId)) {
+    if (!server.enabled) continue;
+    if (server.transport === "stdio") {
+      const argv = server.target.match(/(?:[^\s"']+|"[^"]*"|'[^']*')+/g)?.map((p) => p.replace(/^["']|["']$/g, "")) ?? [];
+      if (!argv.length) continue;
+      let env: Record<string, string> = {};
+      try {
+        env = JSON.parse(server.envJson || "{}") as Record<string, string>;
+      } catch {
+        env = {};
+      }
+      out[server.name] = { command: argv[0], args: argv.slice(1), env };
+    } else {
+      out[server.name] =
+        server.transport === "sse"
+          ? { type: "sse", url: server.target }
+          : { type: "http", url: server.target };
+    }
+  }
+  return out;
 }
 
 /**
@@ -261,6 +468,7 @@ function claudeApprovalBridge(ctx: ToolContext) {
 export async function completeWithGrokCli(
   messages: ProviderMessage[],
   model: string,
+  ctx?: ToolContext,
 ): Promise<string> {
   const bin = detectLocalCli("grok");
   if (!bin) throw new Error("The grok CLI is not installed on this machine.");
@@ -284,7 +492,13 @@ export async function completeWithGrokCli(
   if (system) args.push("--rules", system);
   if (model) args.push("--model", model);
 
-  logEvent({ kind: "cli:spawn", actor: "grok", message: `grok -p (${GROK_READONLY_TOOLS.length} tools)`, data: { model: model || "(cli default)" } });
+  logEvent({
+    kind: "cli:spawn",
+    actor: "grok",
+    conversationId: ctx?.conversationId,
+    message: `grok -p (${GROK_READONLY_TOOLS.length} tools)`,
+    data: { model: model || "(cli default)" },
+  });
   const started = Date.now();
   const child = spawn(bin, args, { stdio: ["ignore", "pipe", "pipe"] });
 
@@ -306,6 +520,7 @@ export async function completeWithGrokCli(
   logEvent({
     kind: "cli:exit",
     actor: "grok",
+    conversationId: ctx?.conversationId,
     message: `grok exited ${code}`,
     durationMs: Date.now() - started,
   });
@@ -484,6 +699,14 @@ export async function completeWithCodexCli(
           continue;
         }
 
+        if (msg.method === "turn/plan/updated" && ctx) {
+          // Codex plans its own work; surface it in the room's shared list
+          // rather than leaving it invisible inside the CLI.
+          void import("./todos.server").then(({ writeTodosFromCodexPlan }) =>
+            writeTodosFromCodexPlan(ctx.conversationId, msg.params),
+          );
+          continue;
+        }
         if (msg.method === "turn/completed") {
           const turn = (msg.params?.turn ?? {}) as {
             items?: { type?: string; text?: string }[];
@@ -530,10 +753,13 @@ export async function completeWithCodexCli(
         send({ jsonrpc: "2.0", method: "initialized" });
         const started = await request("thread/start", {
           cwd: toolsRoot(),
-          // With someone to ask, let it propose writes and route each request
-          // to them ("on-request"). Unattended, it stays read-only and is told
-          // never to ask, since an unanswerable prompt would just stall.
-          sandbox: ctx ? "workspace-write" : "read-only",
+          // Stay read-only either way. `workspace-write` looks like the
+          // permissive-but-supervised option, but it pre-authorises every edit
+          // inside the workspace: measured here, codex created a file without
+          // ever asking. Read-only plus "on-request" means a write has to
+          // escape the sandbox, which is exactly the moment a human should see
+          // it. Unattended (no ctx) nothing may ask, so it never escapes.
+          sandbox: "read-only",
           approvalPolicy: ctx ? "on-request" : "never",
           ephemeral: true,
           ...(model ? { model } : {}),

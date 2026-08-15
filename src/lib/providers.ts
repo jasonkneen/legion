@@ -15,6 +15,8 @@ export type ProviderId =
   | "perplexity"
   | "ollama"
   | "qwen"
+  | "pi"
+  | "hermes"
   | "zhipu"
   | "github";
 
@@ -237,6 +239,32 @@ export const PROVIDERS: ProviderDef[] = [
     kind: "openai",
     baseUrl: "https://dashscope-intl.aliyuncs.com/compatible-mode/v1",
     auth: "key",
+  },
+  {
+    id: "pi",
+    name: "Pi",
+    blurb: "The pi coding CLI on this machine. Uses whatever provider pi is configured with.",
+    defaultModel: "",
+    docsUrl: "https://github.com/badlogic/pi-mono",
+    docsLabel: "pi",
+    placeholder: "(uses the local pi CLI)",
+    kind: "openai",
+    baseUrl: "https://api.openai.com/v1",
+    auth: "none",
+    featured: false,
+  },
+  {
+    id: "hermes",
+    name: "Hermes",
+    blurb: "The hermes agent CLI on this machine, with its own provider and login.",
+    defaultModel: "",
+    docsUrl: "https://github.com/",
+    docsLabel: "hermes",
+    placeholder: "(uses the local hermes CLI)",
+    kind: "openai",
+    baseUrl: "https://api.openai.com/v1",
+    auth: "none",
+    featured: false,
   },
   {
     id: "zhipu",

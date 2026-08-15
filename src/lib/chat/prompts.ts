@@ -38,10 +38,15 @@ export function seatSystemPrompt(seat: Seat, roster: Seat[], task?: string | nul
     "",
     "Inspecting the workspace:",
     "- We can look at the host's project: list_files, read_file, search_files, git_history, git_changes.",
-    "- These are read-only. We cannot write files, run shell commands, or reach the network.",
+    "- We can also change it: write_file and run_command. Those stop and ask the human first, every time, so propose",
+    "  them freely but never assume they ran — read the result before saying what happened.",
     "- Look before we claim. Never invent a path, a file's contents, or a commit — read it.",
     "- If a tool says a path does not exist, that is the answer. Do not retry it a different way.",
     "- Report what we actually found. Quote the path and line when it matters.",
+    "- Seats are not equally equipped. If another rank can do what we cannot — read a file, search the web, use a",
+    "  skill or MCP server we lack — ask_seat them for that one thing and use their answer. One hop only.",
+    "- Use todo_write to publish the plan when work has more than a couple of steps, and update it as it moves.",
+    "- Use ask_human when a decision would change what we build. Do not guess and do not stall.",
     taskLine,
   ]
     .filter((line) => line !== "")

@@ -18,6 +18,9 @@ const LOCAL_CLI_FOR: Partial<Record<ProviderId, LocalCliId>> = {
   anthropic: "claude",
   codex: "codex",
   xai: "grok",
+  pi: "pi",
+  hermes: "hermes",
+  qwen: "qwen",
 };
 
 /** The local CLI backing this provider, if it is installed. */

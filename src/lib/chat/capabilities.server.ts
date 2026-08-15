@@ -71,7 +71,8 @@ function run(bin: string, args: string[], timeoutMs = 30_000): Promise<{ ok: boo
 /** Strip ANSI colour and box-drawing noise the CLIs use for humans. */
 function clean(line: string): string {
   return line
-    .replace(/\[[0-9;]*m/g, "")
+    // eslint-disable-next-line no-control-regex -- stripping ANSI colour is the point
+    .replace(/\u001b\[[0-9;]*m/g, "")
     .replace(/^[\s│├└─┌┐┘|>❯*•]+/, "")
     .trim();
 }

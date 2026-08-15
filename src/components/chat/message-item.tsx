@@ -1,4 +1,4 @@
-import { MoreHorizontal } from "lucide-react";
+import { MoreHorizontal, Reply } from "lucide-react";
 import { RichText } from "@/components/markdown";
 import { SeatAvatar } from "@/components/seat-avatar";
 import {
@@ -34,12 +34,15 @@ export function MessageItem({
   seats,
   streaming,
   onAsk,
+  onReply,
 }: {
   message: ChatMessage;
   seat?: Seat;
   seats: Seat[];
   streaming?: boolean;
   onAsk?: (handle: string, task: string, prompt: string) => void;
+  /** Start a reply addressed at this message's author. */
+  onReply?: (message: ChatMessage, seat?: Seat) => void;
 }) {
   if (message.authorType === "system") {
     return (
@@ -72,6 +75,16 @@ export function MessageItem({
             </span>
           </div>
         </div>
+        {onReply && (
+          <button
+            type="button"
+            onClick={() => onReply(message, seat)}
+            className="grid size-8 place-items-center rounded-md text-fg-subtle hover:bg-bg-subtle hover:text-fg"
+            aria-label={`Reply to @${seat?.handle ?? "seat"}`}
+          >
+            <Reply className="size-4" />
+          </button>
+        )}
         {onAsk && seats.length > 0 && (
           <DropdownMenu>
             <DropdownMenuTrigger className="grid size-8 place-items-center rounded-md text-fg-subtle hover:bg-bg-subtle hover:text-fg">

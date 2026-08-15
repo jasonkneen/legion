@@ -1,8 +1,14 @@
 import { PROVIDER_BY_ID, type ProviderId } from "@/lib/providers";
 import { localCliFor, resolveCreds, updateAccessToken, type ResolvedCreds } from "./keys.server";
 import { isClaudeOAuthToken, refreshCodexTokens } from "./oauth.server";
-import { completeWithClaudeCli, completeWithCodexCli, completeWithGrokCli } from "./local-cli.server";
-import { MAX_TOOL_CALLS, TOOL_DEFS, runTool, type ToolContext } from "./tools.server";
+import {
+  completeWithClaudeCli,
+  completeWithCodexCli,
+  completeWithGrokCli,
+  completeWithSimpleCli,
+} from "./local-cli.server";
+import { MAX_TOOL_CALLS, TOOL_DEFS, runTool, type ToolContext, type ToolDef } from "./tools.server";
+import { logEvent } from "@/lib/log.server";
 import type { ProviderMessage } from "./xai.server";
 
 export type CompleteOpts = {
@@ -72,6 +78,33 @@ export async function completeForProvider(
       creds.model || (creds.authKind === "local_cli" ? `${localCliFor(provider) ?? "local"} CLI default` : creds.model);
     return { ok: true, text: text.trim(), model, provider };
   } catch (err) {
+    const raw = err instanceof Error ? err.message : String(err);
+    const cli = localCliFor(provider);
+
+    // A stored key that the provider now refuses should not silence a seat that
+    // has a working CLI sitting right there. This is the common case after a
+    // subscription token goes stale: the API path 403s while `codex` / `claude`
+    // on the same machine are still signed in.
+    if (cli && creds.authKind !== "local_cli" && (isAuthFailure(raw) || /<html|<!doctype/i.test(raw))) {
+      logEvent({
+        kind: "provider:request",
+        actor: provider,
+        conversationId: opts.toolContext?.conversationId,
+        message: `${def.name} rejected the stored credential; falling back to the local ${cli} CLI`,
+      });
+      try {
+        const text = await dispatch(
+          userId,
+          { ...creds, authKind: "local_cli", apiKey: "", model: "" },
+          messages,
+          opts,
+        );
+        return { ok: true, text: text.trim(), model: `${cli} CLI default`, provider };
+      } catch (fallbackErr) {
+        return { ok: false, error: friendlyError(fallbackErr, def.name) };
+      }
+    }
+
     return { ok: false, error: friendlyError(err, def.name) };
   }
 }
@@ -86,7 +119,12 @@ async function dispatch(
   if (creds.authKind === "local_cli") {
     // No key anywhere — a CLI on this machine is signed in and answers instead.
     if (creds.provider === "codex") return completeWithCodexCli(messages, creds.model, opts.toolContext);
-    if (creds.provider === "xai") return completeWithGrokCli(messages, creds.model);
+    if (creds.provider === "xai") return completeWithGrokCli(messages, creds.model, opts.toolContext);
+    // pi, hermes and qwen are one-shot CLIs with no permission channel.
+    const simple = localCliFor(creds.provider);
+    if (simple === "pi" || simple === "hermes" || simple === "qwen") {
+      return completeWithSimpleCli(simple, messages, creds.model, opts.toolContext);
+    }
     // Claude is the one CLI whose SDK can ask us before each tool, so it gets
     // the write set plus the approval bridge when a context is available.
     return completeWithClaudeCli(messages, creds.model, opts.toolContext);
@@ -103,9 +141,26 @@ async function dispatch(
   return completeOpenAi(def.baseUrl, creds.apiKey, creds.model, messages, opts, creds.provider);
 }
 
+/** True when a failure means "this credential is no longer accepted". */
+function isAuthFailure(message: string): boolean {
+  return /\b401\b|\b403\b|unauthorized|forbidden|invalid.?api.?key|invalid.?x-api-key|token_expired/i.test(message);
+}
+
 function friendlyError(err: unknown, name: string): string {
   const raw = err instanceof Error ? err.message : "The seat went quiet.";
-  if (/401|unauthorized|invalid.?api.?key|invalid.?x-api-key|token_expired/i.test(raw)) {
+
+  // Providers behind a CDN answer with an HTML error page. Dumping that into
+  // the thread is unreadable and buries the status code that matters.
+  if (/<html|<!doctype/i.test(raw)) {
+    const status = /\b(4\d\d|5\d\d)\b/.exec(raw)?.[1];
+    return status
+      ? `${name} refused the request (HTTP ${status}). ${
+          isAuthFailure(status) ? "That credential looks dead — reconnect it in Settings." : "Try again shortly."
+        }`
+      : `${name} returned an error page instead of a reply.`;
+  }
+
+  if (isAuthFailure(raw)) {
     return `${name} rejected that credential. Update it in Settings.`;
   }
   if (/429|rate.?limit/i.test(raw)) {
@@ -230,6 +285,7 @@ async function completeOpenAi(
   // Not every OpenAI-compatible endpoint accepts `tools` (local runtimes and
   // some gateways 400 on it). Try with, drop them permanently if refused.
   let offerTools = opts.tools !== false;
+  const available = await toolsForTurn(opts);
 
   for (let pass = 0; pass < MAX_TOOL_CALLS; pass += 1) {
     const body: Record<string, unknown> = { model, messages: thread, stream: false };
@@ -240,7 +296,7 @@ async function completeOpenAi(
       if (opts.temperature != null) body.temperature = opts.temperature;
     }
     if (offerTools) {
-      body.tools = TOOL_DEFS.map((t) => ({
+      body.tools = available.map((t) => ({
         type: "function",
         function: { name: t.name, description: t.description, parameters: t.parameters },
       }));
@@ -296,6 +352,33 @@ async function completeOpenAi(
   throw new Error(`${provider} kept calling tools without answering.`);
 }
 
+/**
+ * The tools one turn may offer: the built-ins plus whatever MCP servers this
+ * user has enabled. Resolved per turn rather than cached, so enabling a server
+ * takes effect on the next message instead of the next restart.
+ */
+async function toolsForTurn(opts: CompleteOpts): Promise<ToolDef[]> {
+  if (opts.tools === false) return [];
+  const userId = opts.toolContext?.userId;
+  if (!userId) return TOOL_DEFS;
+  try {
+    const { mcpToolsFor } = await import("./mcp.server");
+    const { tools } = await mcpToolsFor(userId);
+    return [
+      ...TOOL_DEFS,
+      ...tools.map((t) => ({
+        name: t.qualifiedName,
+        description: t.description,
+        risk: t.readOnly ? ("read" as const) : ("write" as const),
+        parameters: t.parameters,
+      })),
+    ];
+  } catch {
+    // A broken MCP server must not cost the seat its built-in tools.
+    return TOOL_DEFS;
+  }
+}
+
 /** Tool arguments arrive as a JSON string, and models occasionally mangle it. */
 function parseToolArgs(raw: string | undefined): Record<string, unknown> {
   if (!raw?.trim()) return {};
@@ -335,10 +418,10 @@ async function completeAnthropic(
     role: m.role === "assistant" ? ("assistant" as const) : ("user" as const),
     content: m.content,
   }));
-  const tools =
-    opts.tools === false
-      ? undefined
-      : TOOL_DEFS.map((t) => ({ name: t.name, description: t.description, input_schema: t.parameters }));
+  const available = await toolsForTurn(opts);
+  const tools = available.length
+    ? available.map((t) => ({ name: t.name, description: t.description, input_schema: t.parameters }))
+    : undefined;
 
   const textOf = (blocks: unknown): string =>
     Array.isArray(blocks)

@@ -1,6 +1,9 @@
 import { createFileRoute } from "@tanstack/react-router";
 import { AppShell } from "@/components/app-shell";
 import { AssistantsPanel } from "@/components/assistants-panel";
+import { AccountsPanel } from "@/components/accounts-panel";
+import { McpPanel } from "@/components/mcp-panel";
+import { CapabilitiesPanel } from "@/components/capabilities-panel";
 import { KeysPanel } from "@/components/keys-panel";
 import { RedirectToSignIn } from "@/lib/auth/gates";
 import { useCurrentUserState } from "@/lib/auth/use-current-user";
@@ -40,6 +43,26 @@ function SettingsPage() {
           <div className="mt-6">
             <AssistantsPanel />
           </div>
+          <h2 className="mt-10 text-sm font-medium">Accounts</h2>
+          <p className="mt-1 text-xs text-fg-subtle">
+            Detected automatically. A signed-in CLI is a working seat — no key needed.
+          </p>
+          <div className="mt-4">
+            <AccountsPanel />
+          </div>
+
+          <h2 className="mt-10 text-sm font-medium">Tools</h2>
+          <p className="mt-1 text-xs text-fg-subtle">
+            MCP servers extend every seat. Read-only tools run freely; anything else asks first.
+          </p>
+          <div className="mt-4">
+            <McpPanel />
+          </div>
+
+          <div className="mt-4">
+            <CapabilitiesPanel />
+          </div>
+
           <h2 className="mt-10 text-sm font-medium">Provider keys</h2>
           <p className="mt-1 text-xs text-fg-subtle">
             Saved to {user.primaryEmail ?? "this account"}. We never show the secret again — only a short hint.

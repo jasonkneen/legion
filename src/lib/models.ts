@@ -17,6 +17,8 @@ export type ModelId =
   | "perplexity"
   | "ollama"
   | "qwen"
+  | "pi"
+  | "hermes"
   | "zhipu"
   | "github";
 
@@ -214,6 +216,30 @@ export const MODELS: ModelDef[] = [
     blurb: "Local models. No key.",
     persona:
       "You are a local Ollama model. Stay on the machine. Be honest about what you cannot look up. Prefer short, useful answers.",
+  },
+  {
+    id: "pi",
+    name: "Pi",
+    vendor: "pi CLI",
+    handle: "pi",
+    initials: "Pi",
+    tone: "gpt",
+    provider: "pi",
+    blurb: "Whatever pi is pointed at, run locally.",
+    persona:
+      "You are Pi, running through the local pi CLI. You are direct and practical: answer the question, show the command or the code, skip the throat-clearing. You have no tools in this room, so reason from what is in the thread and say when you would need to look.",
+  },
+  {
+    id: "hermes",
+    name: "Hermes",
+    vendor: "hermes CLI",
+    handle: "hermes",
+    initials: "H",
+    tone: "gpt",
+    provider: "hermes",
+    blurb: "The local hermes agent, with its own provider.",
+    persona:
+      "You are Hermes, running through the local hermes CLI. You are a fast, plain-spoken generalist: give the answer first, then the reasoning if it earns its place. Flag uncertainty rather than padding around it.",
   },
   {
     id: "qwen",

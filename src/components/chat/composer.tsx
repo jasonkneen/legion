@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from "react";
-import { ArrowUp, Plus } from "lucide-react";
+import { ArrowUp, Mic, Plus, X } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { SeatAvatar } from "@/components/seat-avatar";
 import { splitMentionQuery } from "@/lib/chat/mentions";
@@ -11,6 +11,8 @@ export function Composer({
   disabled,
   queueing,
   placeholder,
+  replyTo,
+  onClearReply,
   onSend,
   onAddSeat,
 }: {
@@ -19,13 +21,18 @@ export function Composer({
   /** A seat is mid-turn: submitting adds to the queue instead of sending. */
   queueing?: boolean;
   placeholder?: string;
+  /** The message being replied to, shown as a chip and addressed on send. */
+  replyTo?: { handle: string; excerpt: string } | null;
+  onClearReply?: () => void;
   onSend: (text: string, askAll: boolean) => void;
   onAddSeat?: () => void;
 }) {
   const [value, setValue] = useState("");
   const [askAll, setAskAll] = useState(false);
   const [mentionIndex, setMentionIndex] = useState(0);
+  const [listening, setListening] = useState(false);
   const areaRef = useRef<HTMLTextAreaElement>(null);
+  const recognitionRef = useRef<SpeechRecognitionLike | null>(null);
 
   const caret = areaRef.current?.selectionStart ?? value.length;
   const mention = splitMentionQuery(value, caret);
@@ -67,8 +74,47 @@ export function Composer({
   function submit() {
     const text = value.trim();
     if (!text || disabled) return;
-    onSend(text, askAll);
+    // Replying addresses that rank, unless the text already names someone.
+    const addressed = replyTo && !text.includes(`@${replyTo.handle}`) ? `@${replyTo.handle} ${text}` : text;
+    onSend(addressed, askAll);
     setValue("");
+    onClearReply?.();
+  }
+
+  /**
+   * Dictation through the browser's own speech recognition.
+   *
+   * No audio leaves the page beyond whatever the browser already does for
+   * recognition, and there is no key to configure. Unsupported browsers simply
+   * do not show the button rather than offering one that fails.
+   */
+  function toggleDictation() {
+    if (listening) {
+      recognitionRef.current?.stop();
+      setListening(false);
+      return;
+    }
+    const Ctor = speechRecognitionCtor();
+    if (!Ctor) return;
+    const recognition = new Ctor();
+    recognition.continuous = true;
+    recognition.interimResults = true;
+    recognition.lang = navigator.language || "en-US";
+
+    // Keep the text typed before dictation started; append what is heard.
+    const base = value ? `${value.trim()} ` : "";
+    recognition.onresult = (event: SpeechRecognitionEventLike) => {
+      let heard = "";
+      for (let i = event.resultIndex; i < event.results.length; i += 1) {
+        heard += event.results[i][0]?.transcript ?? "";
+      }
+      setValue(`${base}${heard}`.slice(0, 8000));
+    };
+    recognition.onerror = () => setListening(false);
+    recognition.onend = () => setListening(false);
+    recognition.start();
+    recognitionRef.current = recognition;
+    setListening(true);
   }
 
   return (
@@ -99,6 +145,23 @@ export function Composer({
               <span className="truncate text-xs text-fg-subtle">{opt.label}</span>
             </button>
           ))}
+        </div>
+      )}
+
+      {replyTo && (
+        <div className="mb-1.5 flex items-center gap-2 rounded-lg border border-border bg-bg-subtle/60 px-2.5 py-1.5">
+          <span className="text-xs text-fg-muted">
+            Replying to <span className="font-medium">@{replyTo.handle}</span>
+          </span>
+          <span className="min-w-0 flex-1 truncate text-xs text-fg-subtle">{replyTo.excerpt}</span>
+          <button
+            type="button"
+            onClick={onClearReply}
+            className="shrink-0 rounded p-0.5 text-fg-subtle hover:text-fg"
+            aria-label="Cancel reply"
+          >
+            <X className="size-3.5" />
+          </button>
         </div>
       )}
 
@@ -148,6 +211,18 @@ export function Composer({
                 <Plus />
               </Button>
             )}
+            {speechRecognitionCtor() && (
+              <Button
+                type="button"
+                variant="ghost"
+                size="icon-sm"
+                onClick={toggleDictation}
+                aria-label={listening ? "Stop dictation" : "Dictate"}
+                className={cn(listening && "text-accent")}
+              >
+                <Mic />
+              </Button>
+            )}
             <button
               type="button"
               onClick={() => setAskAll((v) => !v)}
@@ -173,4 +248,34 @@ export function Composer({
       </div>
     </div>
   );
+}
+
+/**
+ * Minimal shape of the Web Speech API we use. Typed here rather than pulling in
+ * DOM lib types that vary by TypeScript version, and it keeps the feature
+ * detection honest: no constructor, no button.
+ */
+type SpeechRecognitionEventLike = {
+  resultIndex: number;
+  results: { [index: number]: { [index: number]: { transcript: string } }; length: number };
+};
+
+type SpeechRecognitionLike = {
+  continuous: boolean;
+  interimResults: boolean;
+  lang: string;
+  start: () => void;
+  stop: () => void;
+  onresult: ((event: SpeechRecognitionEventLike) => void) | null;
+  onerror: (() => void) | null;
+  onend: (() => void) | null;
+};
+
+function speechRecognitionCtor(): (new () => SpeechRecognitionLike) | null {
+  if (typeof window === "undefined") return null;
+  const w = window as unknown as {
+    SpeechRecognition?: new () => SpeechRecognitionLike;
+    webkitSpeechRecognition?: new () => SpeechRecognitionLike;
+  };
+  return w.SpeechRecognition ?? w.webkitSpeechRecognition ?? null;
 }

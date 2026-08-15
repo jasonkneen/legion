@@ -173,6 +173,53 @@ export const TOOL_DEFS: ToolDef[] = [
     },
   },
   {
+    name: "ask_seat",
+    description:
+      "Ask another seat in this chat to do something you cannot — read a file, search the web, use a skill or an MCP "
+      + "server they have and you do not. Their answer comes back to you as the result. One hop only.",
+    parameters: {
+      type: "object",
+      properties: {
+        handle: { type: "string", description: "The seat's handle, e.g. claude." },
+        request: { type: "string", description: "Exactly what you need them to do, in one or two sentences." },
+      },
+      required: ["handle", "request"],
+      additionalProperties: false,
+    },
+  },
+  {
+    name: "todo_write",
+    description:
+      "Publish or update the shared plan for this chat. Send the whole list every time: "
+      + "[{text, status}] where status is pending, in_progress or completed. Every seat and the human see the same list.",
+    parameters: {
+      type: "object",
+      properties: {
+        items: { type: "array", description: "Array of {text, status}." },
+      },
+      required: ["items"],
+      additionalProperties: false,
+    },
+  },
+  {
+    name: "ask_human",
+    description:
+      "Ask the human a multiple-choice question and wait for their answer. Use this instead of guessing when a decision "
+      + "would change what you build. Up to 4 questions at once, each with 2-6 options.",
+    parameters: {
+      type: "object",
+      properties: {
+        questions: {
+          type: "array",
+          description:
+            'Array of {header, question, options:[{label, description}], multiSelect}. Header is a short chip label.',
+        },
+      },
+      required: ["questions"],
+      additionalProperties: false,
+    },
+  },
+  {
     name: "git_changes",
     description:
       "Uncommitted changes in the workspace: `git status` plus a diffstat. Pass full=true for the whole patch.",
@@ -186,6 +233,71 @@ export const TOOL_DEFS: ToolDef[] = [
     },
   },
 ];
+
+/** A file the working tree has changed relative to git HEAD. */
+export type FileChange = {
+  path: string;
+  /** Porcelain status, e.g. "M", "A", "??", "D". */
+  status: string;
+  added: number;
+  removed: number;
+};
+
+/**
+ * Changed files in the workspace, for the session activity panel.
+ *
+ * Diffstat covers tracked edits; untracked files never appear in `git diff`, so
+ * they are collected separately — a seat creating a brand-new file is exactly
+ * the change a human most wants to see.
+ */
+export async function workspaceChanges(): Promise<FileChange[]> {
+  const [statusOut, statOut] = await Promise.all([
+    git(["status", "--porcelain"]),
+    git(["diff", "--numstat", "HEAD"]),
+  ]);
+
+  const counts = new Map<string, { added: number; removed: number }>();
+  for (const line of statOut.split("\n")) {
+    const [added, removed, path] = line.trim().split(/\t/);
+    if (!path) continue;
+    counts.set(path, { added: Number(added) || 0, removed: Number(removed) || 0 });
+  }
+
+  const changes: FileChange[] = [];
+  for (const line of statusOut.split("\n")) {
+    if (!line.trim()) continue;
+    const status = line.slice(0, 2).trim();
+    const path = line.slice(3).trim();
+    if (!path) continue;
+    const count = counts.get(path);
+    changes.push({ path, status, added: count?.added ?? 0, removed: count?.removed ?? 0 });
+  }
+  return changes;
+}
+
+/**
+ * The patch for one changed file.
+ *
+ * Untracked files have no diff, so their contents are shown as an all-added
+ * patch — otherwise a brand-new file, the most interesting change a seat can
+ * make, would render as nothing at all.
+ */
+export async function fileDiff(path: string): Promise<string> {
+  const safe = safePath(path);
+  const rel = relative(toolsRoot(), safe);
+  const tracked = await git(["ls-files", "--error-unmatch", rel]);
+  if (/^git exited/.test(tracked)) {
+    try {
+      const body = readFileSync(safe, "utf8");
+      const lines = body.split("\n").slice(0, 400);
+      return `new file: ${rel}\n${lines.map((l) => `+${l}`).join("\n")}`;
+    } catch {
+      return `new file: ${rel} (unreadable)`;
+    }
+  }
+  const patch = await git(["diff", "--", rel]);
+  return patch === "(no output)" ? `${rel}: no unstaged changes` : patch;
+}
 
 /** Run `git` with a fixed argument list — no shell, so nothing to inject into. */
 function git(args: string[]): Promise<string> {
@@ -346,10 +458,22 @@ export type ToolContext = {
   actor: string;
 };
 
+/** Whether an MCP tool declared itself non-mutating; unknown means "no". */
+async function mcpToolIsReadOnly(userId: string | undefined, qualifiedName: string): Promise<boolean> {
+  if (!userId) return false;
+  const { mcpToolsFor } = await import("./mcp.server");
+  const { tools } = await mcpToolsFor(userId);
+  return tools.find((t) => t.qualifiedName === qualifiedName)?.readOnly === true;
+}
+
 /** One-line risk summary shown in the approval prompt. */
 function approvalReason(name: string, args: Record<string, unknown>): string {
   if (name === "write_file") return `Write ${String(args.path ?? "a file")} in your workspace`;
   if (name === "run_command") return `Run: ${String(args.command ?? "").slice(0, 200)}`;
+  if (name.startsWith("mcp__")) {
+    const [, server, ...rest] = name.split("__");
+    return `Run ${rest.join("__")} on the ${server} MCP server`;
+  }
   return `Run ${name}`;
 }
 
@@ -359,7 +483,15 @@ export async function runTool(
   ctx?: ToolContext,
 ): Promise<string> {
   const def = TOOL_DEFS.find((t) => t.name === name);
-  if (def?.risk === "write") {
+
+  // MCP tools are not in TOOL_DEFS — they arrive per user, per turn. Anything a
+  // server does not annotate `readOnlyHint` is treated as mutating and gated,
+  // because an unknown tool from a third party is the last thing to trust by
+  // default.
+  const isMcp = name.startsWith("mcp__");
+  const needsApproval = def?.risk === "write" || (isMcp && !(await mcpToolIsReadOnly(ctx?.userId, name)));
+
+  if (needsApproval) {
     // Without a context there is nobody to ask, and a tool that changes the
     // workstation must never fall back to "allow". Refusing is the safe default
     // and reads as a normal tool result to the model.
@@ -382,11 +514,21 @@ export async function runTool(
   }
 
   const started = Date.now();
-  logEvent({ kind: "tool:start", actor: name, message: `${name} ${JSON.stringify(args)}`, data: args });
+  // Scope every event to the chat that caused it, so the activity panel can
+  // show one conversation's work rather than the whole process's.
+  const conversationId = ctx?.conversationId;
+  logEvent({
+    kind: "tool:start",
+    actor: name,
+    conversationId,
+    message: `${ctx?.actor ? `@${ctx.actor} · ` : ""}${name} ${JSON.stringify(args)}`,
+    data: args,
+  });
   const finish = (out: string, failed = false) => {
     logEvent({
       kind: failed ? "tool:error" : "tool:end",
       actor: name,
+      conversationId,
       message: failed ? out : `${name} returned ${out.length} chars`,
       durationMs: Date.now() - started,
       data: { preview: out.slice(0, 200) },
@@ -394,13 +536,18 @@ export async function runTool(
     return out;
   };
   try {
-    return finish(await execute(name, args));
+    return finish(await execute(name, args, ctx));
   } catch (err) {
     return finish(`${name} failed: ${err instanceof Error ? err.message : String(err)}`, true);
   }
 }
 
-async function execute(name: string, args: Record<string, unknown>): Promise<string> {
+async function execute(name: string, args: Record<string, unknown>, ctx?: ToolContext): Promise<string> {
+  if (name.startsWith("mcp__")) {
+    if (!ctx?.userId) return `${name} needs a signed-in user to resolve its MCP server.`;
+    const { callMcpTool } = await import("./mcp.server");
+    return clip(await callMcpTool(ctx.userId, name, args));
+  }
   try {
     switch (name) {
       case "list_files":
@@ -423,6 +570,38 @@ async function execute(name: string, args: Record<string, unknown>): Promise<str
         const command = asString(args.command);
         if (!command) return "run_command needs a command.";
         return clip(await runCommand(command));
+      }
+      case "ask_seat": {
+        if (!ctx) return "ask_seat needs a live conversation.";
+        const handle = asString(args.handle);
+        const request = asString(args.request);
+        if (!handle || !request) return "ask_seat needs both a handle and a request.";
+        const { delegateToSeat } = await import("./delegate.server");
+        return clip(await delegateToSeat(ctx, handle, request));
+      }
+      case "todo_write": {
+        if (!ctx) return "todo_write needs a conversation to write into.";
+        const { writeTodos } = await import("./todos.server");
+        const raw = Array.isArray(args.items) ? args.items : [];
+        const items = raw.map((i) => {
+          const row = (i ?? {}) as Record<string, unknown>;
+          return { text: String(row.text ?? row.title ?? row.step ?? ""), status: row.status };
+        });
+        const written = writeTodos(ctx.conversationId, ctx.actor, items);
+        return `Plan updated: ${written.length} item(s), ${written.filter((t) => t.status === "completed").length} done.`;
+      }
+      case "ask_human": {
+        if (!ctx) return "ask_human needs a live conversation; nobody is here to answer.";
+        const { askHuman, parseQuestions } = await import("./questions.server");
+        const questions = parseQuestions(args.questions);
+        if (!questions.length) {
+          return "ask_human needs at least one question with two or more options.";
+        }
+        const answers = await askHuman(ctx.conversationId, ctx.actor, questions);
+        if (!answers) return "The human did not answer. Proceed with your best judgement and say what you assumed.";
+        return Object.entries(answers)
+          .map(([header, choice]) => `${header}: ${choice}`)
+          .join("\n");
       }
       case "git_history": {
         const count = Math.min(Math.max(asNumber(args.count, 10), 1), 50);
