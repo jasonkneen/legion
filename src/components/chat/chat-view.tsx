@@ -4,6 +4,10 @@ import { KeyRound } from "lucide-react";
 import { toast } from "sonner";
 import { AddSeatDialog, type AfterSeat } from "@/components/add-seat-dialog";
 import { Composer } from "@/components/chat/composer";
+import { QueueTray, type QueuedMessage } from "@/components/chat/queue-tray";
+import { ApprovalPanel } from "@/components/chat/approval-panel";
+import { answerApproval, listPendingApprovals } from "@/lib/chat/approval-actions";
+import type { ApprovalScope, PendingApprovalView } from "@/lib/chat/approvals.server";
 import { MessageItem } from "@/components/chat/message-item";
 import { SeatRail } from "@/components/chat/seat-rail";
 import { SeatAvatar } from "@/components/seat-avatar";
@@ -13,6 +17,11 @@ import type { ChatMessage, Conversation, NewSeatInput, Seat } from "@/lib/chat/t
 import { MODEL_BY_ID, providerForModel, type ModelId } from "@/lib/models";
 import { APP_TAGLINE } from "@/lib/brand";
 import type { ProviderStatus } from "@/lib/providers";
+
+/** Stable-enough id for a queue row; these never leave the browser. */
+function newQueueId(): string {
+  return `q-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+}
 
 function greeting() {
   return APP_TAGLINE;
@@ -31,6 +40,12 @@ export function ChatView({
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [loading, setLoading] = useState(true);
   const [sending, setSending] = useState(false);
+  // Messages typed while a seat was working. Kept in the view rather than a
+  // store: a queue belongs to the open conversation and should not outlive it.
+  const [queue, setQueue] = useState<QueuedMessage[]>([]);
+  // Tool calls parked waiting on a decision. A parked turn holds a child
+  // process open, so this is polled only while a seat is actually working.
+  const [approvals, setApprovals] = useState<PendingApprovalView[]>([]);
   const [workingHandle, setWorkingHandle] = useState<string | null>(null);
   const [status, setStatus] = useState<string | null>(null);
   const [elapsed, setElapsed] = useState(0);
@@ -93,6 +108,45 @@ export function ChatView({
     return () => window.clearInterval(timer);
   }, [workingHandle]);
 
+  useEffect(() => {
+    if (!sending) {
+      setApprovals([]);
+      return;
+    }
+    let stopped = false;
+    const poll = () => {
+      void listPendingApprovals({ data: conversationId })
+        .then((rows) => {
+          if (!stopped) setApprovals(rows);
+        })
+        .catch(() => undefined);
+    };
+    poll();
+    const timer = window.setInterval(poll, 1200);
+    return () => {
+      stopped = true;
+      window.clearInterval(timer);
+    };
+  }, [sending, conversationId]);
+
+  const decideApprovalRequest = async (id: string, scope: ApprovalScope) => {
+    setApprovals((rows) => rows.filter((r) => r.id !== id));
+    await answerApproval({ data: { id, scope } }).catch(() => {
+      toast.error("That approval had already expired");
+    });
+  };
+
+  // Drain one queued message whenever the room goes quiet. One per pass:
+  // `send` flips `sending` back on, which re-runs this effect for the next.
+  useEffect(() => {
+    if (sending || queue.length === 0 || seats.length === 0) return;
+    const [next, ...rest] = queue;
+    setQueue(rest);
+    void send(next.text, next.askAll);
+    // `send` is stable enough for this: it only reads state it also sets.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [sending, queue, seats.length]);
+
   const readyByProvider = new Map(providers.map((p) => [p.id, p.configured]));
   const missingSeats = seats.filter((s) => !readyByProvider.get(providerForModel(s.modelId)));
 
@@ -140,11 +194,32 @@ export function ChatView({
       });
       window.dispatchEvent(new Event("chamber:updated"));
 
+      // Naming a rank who is not seated used to be answered by whoever was
+      // first, under the wrong handle. Now it is said out loud instead.
+      if (posted.unknownHandles.length) {
+        const names = posted.unknownHandles.map((h) => `@${h}`).join(", ");
+        setMessages((prev) => [
+          ...prev,
+          {
+            id: `unknown-${Date.now()}`,
+            conversationId,
+            authorType: "system",
+            agentId: null,
+            content: `${names} ${posted.unknownHandles.length > 1 ? "are" : "is"} not seated in this chat. Add ${posted.unknownHandles.length > 1 ? "them" : "them"} with the + button, or address a rank who is here.`,
+            mentions: posted.unknownHandles,
+            task: "unknown-handle",
+            createdAt: new Date().toISOString(),
+          },
+        ]);
+      }
+
       const spoken = new Set<string>();
-      const queue = [...posted.targetHandles];
+      // Named for what it holds: seats still to speak this turn. Distinct from
+      // the composer's message queue.
+      const toSpeak = [...posted.targetHandles];
       let hops = 0;
-      while (queue.length && hops < 5) {
-        const handle = queue.shift()!;
+      while (toSpeak.length && hops < 5) {
+        const handle = toSpeak.shift()!;
         if (spoken.has(handle)) continue;
         setWorkingHandle(handle);
         setStatus(`@${handle} is thinking`);
@@ -184,14 +259,18 @@ export function ChatView({
           spoken.add(handle);
           hops += 1;
           for (const next of reply.followUpHandles) {
-            if (!spoken.has(next) && !queue.includes(next) && hops + queue.length < 5) {
-              queue.push(next);
+            if (!spoken.has(next) && !toSpeak.includes(next) && hops + toSpeak.length < 5) {
+              toSpeak.push(next);
             }
           }
         }
       }
 
-      for (const handle of posted.leftoverHandles.slice(0, 2)) {
+      // Jumping in is for ranks who were not addressed while others were. If
+      // the message addressed nobody who is here, an unasked rank answering
+      // anyway is the same impersonation problem in a quieter form.
+      const mayJumpIn = posted.targetHandles.length > 0;
+      for (const handle of mayJumpIn ? posted.leftoverHandles.slice(0, 2) : []) {
         if (spoken.has(handle)) continue;
         setWorkingHandle(handle);
         setStatus(`@${handle} may jump in`);
@@ -338,9 +417,23 @@ export function ChatView({
 
       <div className="px-3 pt-1 pb-[max(1rem,env(safe-area-inset-bottom))] md:px-6">
         <div className="mx-auto max-w-2xl">
+          {approvals[0] && (
+            <ApprovalPanel request={approvals[0]} onDecide={decideApprovalRequest} />
+          )}
+          <QueueTray
+            queue={queue}
+            draining={sending}
+            onEdit={(id, text) => setQueue((q) => q.map((row) => (row.id === id ? { ...row, text } : row)))}
+            onSendNow={(id) => setQueue((q) => [...q.filter((r) => r.id === id), ...q.filter((r) => r.id !== id)])}
+            onRemove={(id) => setQueue((q) => q.filter((row) => row.id !== id))}
+            onClear={() => setQueue([])}
+          />
           <Composer
             seats={seats}
-            disabled={sending || seats.length === 0}
+            // Only a room with no seats blocks typing. While a seat is working,
+            // the composer stays live and Enter queues instead — see `submit`.
+            disabled={seats.length === 0}
+            queueing={sending}
             placeholder={
               seats.length === 0
                 ? "Seat a rank before we write"
@@ -348,11 +441,19 @@ export function ChatView({
                   ? `The league · @${seats[0]?.handle ?? "name"} to call a rank`
                   : "Write to us. Enter to send"
             }
-            onSend={(text, askAll) => void send(text, askAll)}
+            onSend={(text, askAll) => {
+              if (sending) {
+                setQueue((q) => [...q, { id: newQueueId(), text, askAll }]);
+                return;
+              }
+              void send(text, askAll);
+            }}
             onAddSeat={() => setAddOpen(true)}
           />
           <p className="mt-2 px-1 text-[11px] text-fg-subtle">
-            {sending && status ? status : "Enter to send · Shift+Enter for a new line"}
+            {sending
+              ? `${status ?? "working"} · Enter adds to the queue`
+              : "Enter to send · Shift+Enter for a new line"}
           </p>
         </div>
       </div>

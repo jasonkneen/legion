@@ -17,6 +17,7 @@ import { detectLocalCli, type LocalCliId } from "./local-cli.server";
 const LOCAL_CLI_FOR: Partial<Record<ProviderId, LocalCliId>> = {
   anthropic: "claude",
   codex: "codex",
+  xai: "grok",
 };
 
 /** The local CLI backing this provider, if it is installed. */

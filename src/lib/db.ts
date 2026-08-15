@@ -52,6 +52,7 @@ const globalRef = globalThis as typeof globalThis & {
   __pgSqlPromise__?: Promise<Sql>;
   __pgliteInstance__?: Promise<import("@electric-sql/pglite").PGlite>;
   __pgliteMigrateChain__?: Promise<void>;
+  __sqlPromiseRef__?: { current: Promise<Sql> | null };
 };
 
 /**
@@ -256,7 +257,21 @@ async function createPgliteSql(): Promise<Sql> {
   });
 }
 
-let sqlPromise: Promise<Sql> | null = null;
+/**
+ * Memoized on `globalThis`, not in module scope.
+ *
+ * A dev HMR reload re-evaluates this module but keeps `globalThis`, so a
+ * module-level cache is silently dropped on every save: each reload re-entered
+ * `createPgliteSql()`, replayed the migration pass, and queued it behind all the
+ * earlier ones. The PGLite instance survived (it was already on `globalThis`),
+ * so nothing looked broken — the auth path just got slower with every edit,
+ * measured at 0.008s cold versus 0.4–1.2s after eight reloads, never
+ * recovering. After a few hours of editing that reads as a hung server.
+ */
+function sqlRef(): { current: Promise<Sql> | null } {
+  globalRef.__sqlPromiseRef__ ??= { current: null };
+  return globalRef.__sqlPromiseRef__;
+}
 
 async function createSql(): Promise<Sql> {
   if (typeof window !== "undefined") {
@@ -276,11 +291,12 @@ async function createSql(): Promise<Sql> {
  * both backends — define tables there, never inline in server functions.
  */
 export function getSql(): Promise<Sql> {
-  sqlPromise ??= createSql().catch((err) => {
-    sqlPromise = null; // don't memoize failures — let the next call retry
+  const ref = sqlRef();
+  ref.current ??= createSql().catch((err) => {
+    sqlRef().current = null; // don't memoize failures — let the next call retry
     throw err;
   });
-  return sqlPromise;
+  return ref.current;
 }
 
 /**

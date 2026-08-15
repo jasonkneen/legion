@@ -1,8 +1,8 @@
 import { PROVIDER_BY_ID, type ProviderId } from "@/lib/providers";
 import { localCliFor, resolveCreds, updateAccessToken, type ResolvedCreds } from "./keys.server";
 import { isClaudeOAuthToken, refreshCodexTokens } from "./oauth.server";
-import { completeWithClaudeCli, completeWithCodexCli } from "./local-cli.server";
-import { MAX_TOOL_CALLS, TOOL_DEFS, runTool } from "./tools.server";
+import { completeWithClaudeCli, completeWithCodexCli, completeWithGrokCli } from "./local-cli.server";
+import { MAX_TOOL_CALLS, TOOL_DEFS, runTool, type ToolContext } from "./tools.server";
 import type { ProviderMessage } from "./xai.server";
 
 export type CompleteOpts = {
@@ -10,6 +10,11 @@ export type CompleteOpts = {
   temperature?: number;
   /** Set false for turns that must answer immediately (the jump-in check). */
   tools?: boolean;
+  /**
+   * Identifies the turn for tools that need a human decision. Without it,
+   * write-capable tools refuse rather than run unattended.
+   */
+  toolContext?: ToolContext;
 };
 
 /** A chat-completions message, including the tool-call shapes. */
@@ -80,9 +85,11 @@ async function dispatch(
   const def = PROVIDER_BY_ID[creds.provider];
   if (creds.authKind === "local_cli") {
     // No key anywhere — a CLI on this machine is signed in and answers instead.
-    return creds.provider === "codex"
-      ? completeWithCodexCli(messages, creds.model)
-      : completeWithClaudeCli(messages, creds.model);
+    if (creds.provider === "codex") return completeWithCodexCli(messages, creds.model, opts.toolContext);
+    if (creds.provider === "xai") return completeWithGrokCli(messages, creds.model);
+    // Claude is the one CLI whose SDK can ask us before each tool, so it gets
+    // the write set plus the approval bridge when a context is available.
+    return completeWithClaudeCli(messages, creds.model, opts.toolContext);
   }
   if (def.kind === "codex" || (creds.provider === "codex" && creds.authKind === "oauth")) {
     return completeCodex(userId, creds, messages, opts);
@@ -267,7 +274,7 @@ async function completeOpenAi(
       thread.push({
         role: "tool",
         tool_call_id: call.id,
-        content: await runTool(call.function?.name ?? "", parseToolArgs(call.function?.arguments)),
+        content: await runTool(call.function?.name ?? "", parseToolArgs(call.function?.arguments), opts.toolContext),
       });
     }
   }
@@ -366,7 +373,7 @@ async function completeAnthropic(
       results.push({
         type: "tool_result",
         tool_use_id: use.id,
-        content: await runTool(use.name, use.input ?? {}),
+        content: await runTool(use.name, use.input ?? {}, opts.toolContext),
       });
     }
     thread.push({ role: "user", content: results });

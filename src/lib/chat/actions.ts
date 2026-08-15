@@ -329,16 +329,23 @@ export const postUserMessage = createServerFn({ method: "POST" })
     const byHandle = new Map(seats.map((s) => [s.handle, s]));
 
     let targets: Seat[] = [];
+    /** Handles the human addressed that nobody in this chat answers to. */
+    let unknownHandles: string[] = [];
     if (forced.length) {
       targets = forced.map((h) => byHandle.get(h)).filter((s): s is Seat => Boolean(s));
     } else if (askAll) {
       targets = [...seats];
     } else {
-      const named = mentions
-        .filter((h) => h !== "all")
-        .map((h) => byHandle.get(h))
-        .filter((s): s is Seat => Boolean(s));
-      targets = named.length ? named : [seats[0]!];
+      const addressed = mentions.filter((h) => h !== "all");
+      const named = addressed.map((h) => byHandle.get(h)).filter((s): s is Seat => Boolean(s));
+      unknownHandles = addressed.filter((h) => !byHandle.has(h));
+      // Addressing nobody in particular means "whoever holds the room", so the
+      // first seat answers. But naming a rank who is not seated must NOT quietly
+      // hand the turn to a different one — a rank replying under someone else's
+      // handle makes the whole thread untrustworthy. Say they are not here.
+      if (named.length) targets = named;
+      else if (unknownHandles.length) targets = [];
+      else targets = [seats[0]!];
     }
 
     const userMessage: ChatMessage = {
@@ -378,6 +385,7 @@ export const postUserMessage = createServerFn({ method: "POST" })
       userMessage,
       title,
       targetHandles: targets.map((s) => s.handle),
+      unknownHandles,
       leftoverHandles: seats.filter((s) => !targets.some((t) => t.id === s.id)).map((s) => s.handle),
     };
   });
@@ -427,6 +435,8 @@ export const generateSeatReply = createServerFn({ method: "POST" })
       [{ role: "system", content: system }, ...toProviderMessages(history, seats)],
       {
         maxTokens: data.jumpIn ? 280 : 1400,
+        // Names the human and the room, so a write tool knows who to ask.
+        toolContext: { userId: context.userId, conversationId: data.conversationId, actor: seat.handle },
         // The jump-in check must answer immediately (usually "SKIP"); handing it
         // tools would turn a cheap interjection into an inspection round.
         tools: !data.jumpIn,

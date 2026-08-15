@@ -18,10 +18,11 @@ import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { accessSync, constants } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
-import { MAX_TOOL_CALLS, toolsRoot } from "./tools.server";
+import { MAX_TOOL_CALLS, toolsRoot, type ToolContext } from "./tools.server";
+import { logEvent } from "@/lib/log.server";
 import type { ProviderMessage } from "./xai.server";
 
-export type LocalCliId = "claude" | "codex";
+export type LocalCliId = "claude" | "codex" | "grok";
 
 /** How long a single local turn may take before the child is killed. */
 const TURN_TIMEOUT_MS = 180_000;
@@ -45,7 +46,19 @@ function extraBinDirs(): string[] {
 const ENV_OVERRIDE: Record<LocalCliId, string> = {
   claude: "CLAUDE_CLI_PATH",
   codex: "CODEX_CLI_PATH",
+  grok: "GROK_CLI_PATH",
 };
+
+/**
+ * Grok's built-in tools, filtered to the ones that only look.
+ *
+ * `--tools` is an allowlist, so anything omitted is unavailable rather than
+ * merely discouraged: `run_terminal_command`, `search_replace`, the schedulers
+ * and `spawn_subagent` all stay off for an unattended chat seat. Web search and
+ * page fetch are in — they read the world without touching the workstation, and
+ * they are the one capability the API seats cannot offer.
+ */
+const GROK_READONLY_TOOLS = ["read_file", "list_dir", "grep", "web_search", "open_page", "open_page_with_find"];
 
 type DetectCache = Partial<Record<LocalCliId, string | null>>;
 const globalRef = globalThis as typeof globalThis & { __legionLocalCli__?: DetectCache };
@@ -137,9 +150,20 @@ function renderPrompt(messages: ProviderMessage[]): { system: string; prompt: st
  * tool loop the way MAX_TOOL_CALLS bounds the API ones.
  */
 const CLAUDE_READONLY_TOOLS = ["Read", "Glob", "Grep"];
+
+/**
+ * Tools the Claude seat may use once a human says yes.
+ *
+ * Kept separate from the read-only set: these are only offered when a caller
+ * supplies a tool context, because without one there is nobody to approve them
+ * and an unattended turn must not edit the workstation.
+ */
+const CLAUDE_WRITE_TOOLS = ["Edit", "Write", "Bash"];
+
 export async function completeWithClaudeCli(
   messages: ProviderMessage[],
   model: string,
+  ctx?: ToolContext,
 ): Promise<string> {
   const { query } = await import("@anthropic-ai/claude-agent-sdk");
   const { system, prompt } = renderPrompt(messages);
@@ -156,8 +180,12 @@ export async function completeWithClaudeCli(
         ...(executable ? { pathToClaudeCodeExecutable: executable } : {}),
         ...(model ? { model } : {}),
         ...(system ? { systemPrompt: system } : {}),
-        tools: CLAUDE_READONLY_TOOLS,
+        tools: ctx ? [...CLAUDE_READONLY_TOOLS, ...CLAUDE_WRITE_TOOLS] : CLAUDE_READONLY_TOOLS,
+        // Reads are pre-approved; anything that writes goes through canUseTool
+        // below, which parks the turn on the same approval registry the API
+        // seats use — so one prompt style covers every kind of agent.
         allowedTools: CLAUDE_READONLY_TOOLS,
+        ...(ctx ? { canUseTool: claudeApprovalBridge(ctx) } : {}),
         settingSources: [],
         cwd: toolsRoot(),
         maxTurns: MAX_TOOL_CALLS,
@@ -181,6 +209,172 @@ export async function completeWithClaudeCli(
   } finally {
     clearTimeout(timer);
   }
+}
+
+/**
+ * Turn Claude Code's own permission prompt into a Legion approval.
+ *
+ * The Agent SDK asks its host before running a tool it is not pre-allowed; that
+ * host is us. Rather than answer from a static rule, park on the same registry
+ * the API seats use, so the human sees one consistent prompt whichever kind of
+ * agent is asking. A refusal comes back as `behavior: "deny"` with a message
+ * the model can read, which keeps the turn alive instead of killing it.
+ */
+function claudeApprovalBridge(ctx: ToolContext) {
+  return async (
+    toolName: string,
+    input: Record<string, unknown>,
+    options: { title?: string; description?: string },
+  ): Promise<{ behavior: "allow"; updatedInput: Record<string, unknown> } | { behavior: "deny"; message: string }> => {
+    const { requestApproval } = await import("./approvals.server");
+    const outcome = await requestApproval({
+      userId: ctx.userId,
+      conversationId: ctx.conversationId,
+      actor: ctx.actor,
+      tool: toolName,
+      args: input,
+      // The SDK renders a better sentence than we could reconstruct.
+      reason: options.title ?? options.description ?? `Run ${toolName}`,
+    });
+    return outcome.allowed
+      ? { behavior: "allow", updatedInput: input }
+      : {
+          behavior: "deny",
+          message:
+            outcome.scope === "timeout"
+              ? "No answer in time; treat this tool as unavailable and continue."
+              : "The human declined. Do not retry; continue without it.",
+        };
+  };
+}
+
+/**
+ * One turn through the `grok` CLI in headless single-turn mode.
+ *
+ * `-p` prints one response and exits, and `--output-format json` wraps it with
+ * the stop reason and usage, so unlike the other two CLIs there is no protocol
+ * to speak — just a child process and a JSON document. The system prompt goes
+ * through `--rules` (appended to grok's own) rather than
+ * `--system-prompt-override`, which would throw away the harness instructions
+ * that make its tools work.
+ */
+export async function completeWithGrokCli(
+  messages: ProviderMessage[],
+  model: string,
+): Promise<string> {
+  const bin = detectLocalCli("grok");
+  if (!bin) throw new Error("The grok CLI is not installed on this machine.");
+
+  const { system, prompt } = renderPrompt(messages);
+  const args = [
+    "-p",
+    prompt,
+    "--output-format",
+    "json",
+    "--cwd",
+    toolsRoot(),
+    "--tools",
+    GROK_READONLY_TOOLS.join(","),
+    "--permission-mode",
+    "dontAsk",
+    "--no-subagents",
+    "--max-turns",
+    String(MAX_TOOL_CALLS),
+  ];
+  if (system) args.push("--rules", system);
+  if (model) args.push("--model", model);
+
+  logEvent({ kind: "cli:spawn", actor: "grok", message: `grok -p (${GROK_READONLY_TOOLS.length} tools)`, data: { model: model || "(cli default)" } });
+  const started = Date.now();
+  const child = spawn(bin, args, { stdio: ["ignore", "pipe", "pipe"] });
+
+  let stdout = "";
+  let stderr = "";
+  child.stdout.on("data", (c: Buffer) => {
+    stdout += c.toString();
+  });
+  child.stderr.on("data", (c: Buffer) => {
+    stderr = `${stderr}${c.toString()}`.slice(-2000);
+  });
+
+  const timer = setTimeout(() => child.kill(), TURN_TIMEOUT_MS);
+  const code = await new Promise<number | null>((resolveExit, reject) => {
+    child.on("error", reject);
+    child.on("close", resolveExit);
+  }).finally(() => clearTimeout(timer));
+
+  logEvent({
+    kind: "cli:exit",
+    actor: "grok",
+    message: `grok exited ${code}`,
+    durationMs: Date.now() - started,
+  });
+
+  if (code !== 0 && !stdout.trim()) {
+    throw new Error(`grok exited ${code}${stderr ? `: ${stderr.slice(-200)}` : ""}`);
+  }
+
+  // Older/plain output is bare text; JSON mode is the documented shape.
+  try {
+    const parsed = JSON.parse(stdout) as { text?: string; stopReason?: string; error?: string };
+    if (parsed.error) throw new Error(parsed.error);
+    const text = parsed.text?.trim();
+    if (text) return text;
+    throw new Error(
+      parsed.stopReason === "cancelled"
+        ? "grok stopped before answering (hit its turn limit)."
+        : "grok returned an empty reply.",
+    );
+  } catch (err) {
+    if (err instanceof SyntaxError) {
+      const text = stdout.trim();
+      if (text) return text;
+    }
+    throw err;
+  }
+}
+
+/** Codex approval methods, and how each names the thing being approved. */
+const CODEX_APPROVAL_METHODS = new Set([
+  "item/commandExecution/requestApproval",
+  "item/fileChange/requestApproval",
+  "item/permissions/requestApproval",
+  "execCommandApproval",
+  "applyPatchApproval",
+]);
+
+/**
+ * Answer a Codex approval request from the human.
+ *
+ * Codex asks over the wire mid-turn, the same way Claude's SDK asks through a
+ * callback, so both end up on the one registry. Its vocabulary is richer than
+ * ours in one direction (`cancel` also interrupts the turn) and poorer in
+ * another (no cross-session memory), so "always" answers `acceptForSession`
+ * here and is remembered on our side for the next session instead.
+ */
+async function codexApprovalDecision(
+  ctx: ToolContext,
+  method: string,
+  params: Record<string, unknown> | undefined,
+): Promise<string> {
+  const { requestApproval } = await import("./approvals.server");
+  const command = typeof params?.command === "string" ? params.command : "";
+  const reasonField = typeof params?.reason === "string" ? params.reason : "";
+  const isFileChange = method.includes("fileChange") || method === "applyPatchApproval";
+
+  const outcome = await requestApproval({
+    userId: ctx.userId,
+    conversationId: ctx.conversationId,
+    actor: ctx.actor,
+    tool: isFileChange ? "codex:file_change" : "codex:run_command",
+    args: command ? { command } : {},
+    reason:
+      reasonField ||
+      (command ? `Run: ${command.slice(0, 200)}` : isFileChange ? "Apply file changes in your workspace" : "Run a tool"),
+  });
+
+  if (!outcome.allowed) return "decline"; // the turn continues without it
+  return outcome.scope === "session" || outcome.scope === "always" ? "acceptForSession" : "accept";
 }
 
 /**
@@ -220,6 +414,7 @@ type JsonRpcMessage = {
 export async function completeWithCodexCli(
   messages: ProviderMessage[],
   model: string,
+  ctx?: ToolContext,
 ): Promise<string> {
   const bin = detectLocalCli("codex");
   if (!bin) throw new Error("The codex CLI is not installed on this machine.");
@@ -274,11 +469,18 @@ export async function completeWithCodexCli(
           continue;
         }
 
-        // A request FROM the server (an approval, an elicitation). Nothing here
-        // can answer one, and the sandbox settings should prevent them, so
-        // refuse rather than hang the turn.
+        // A request FROM the server. Approvals get routed to the human when
+        // this turn has one; anything else (elicitations, tool-call hosting)
+        // still has no answer here, so refuse it rather than hang the turn.
         if (msg.id != null && msg.method) {
-          send({ jsonrpc: "2.0", id: msg.id, error: { code: -32601, message: "no interactive client" } });
+          const id = msg.id;
+          if (ctx && CODEX_APPROVAL_METHODS.has(msg.method)) {
+            void codexApprovalDecision(ctx, msg.method, msg.params)
+              .then((decision) => send({ jsonrpc: "2.0", id, result: { decision } }))
+              .catch(() => send({ jsonrpc: "2.0", id, result: { decision: "decline" } }));
+            continue;
+          }
+          send({ jsonrpc: "2.0", id, error: { code: -32601, message: "no interactive client" } });
           continue;
         }
 
@@ -328,8 +530,11 @@ export async function completeWithCodexCli(
         send({ jsonrpc: "2.0", method: "initialized" });
         const started = await request("thread/start", {
           cwd: toolsRoot(),
-          sandbox: "read-only",
-          approvalPolicy: "never",
+          // With someone to ask, let it propose writes and route each request
+          // to them ("on-request"). Unattended, it stays read-only and is told
+          // never to ask, since an unanswerable prompt would just stall.
+          sandbox: ctx ? "workspace-write" : "read-only",
+          approvalPolicy: ctx ? "on-request" : "never",
           ephemeral: true,
           ...(model ? { model } : {}),
           ...(system ? { developerInstructions: system } : {}),

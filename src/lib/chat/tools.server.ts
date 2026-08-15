@@ -10,8 +10,9 @@
  * into whichever schema a provider expects.
  */
 import { spawn } from "node:child_process";
-import { readdirSync, readFileSync, realpathSync, statSync } from "node:fs";
-import { isAbsolute, join, relative, resolve } from "node:path";
+import { existsSync, mkdirSync, readdirSync, readFileSync, realpathSync, statSync, writeFileSync } from "node:fs";
+import { dirname, isAbsolute, join, relative, resolve } from "node:path";
+import { logEvent } from "@/lib/log.server";
 
 /** Most tool calls one turn may make before we stop feeding results back. */
 export const MAX_TOOL_CALLS = 12;
@@ -25,6 +26,12 @@ const SKIP_DIRS = new Set([".git", "node_modules", "dist", ".output", ".nitro", 
 export type ToolDef = {
   name: string;
   description: string;
+  /**
+   * `read` tools run unattended. `write` tools change the workstation or run
+   * commands on it, so they park the turn for a human decision first — see
+   * `approvals.server.ts`.
+   */
+  risk?: "read" | "write";
   /** JSON Schema for the arguments object. */
   parameters: {
     type: "object";
@@ -137,6 +144,35 @@ export const TOOL_DEFS: ToolDef[] = [
     },
   },
   {
+    name: "write_file",
+    description:
+      "Write a text file in the workspace, creating or replacing it. Requires the human to approve before it runs.",
+    risk: "write",
+    parameters: {
+      type: "object",
+      properties: {
+        path: { type: "string", description: "File path relative to the workspace root." },
+        content: { type: "string", description: "Full new contents of the file." },
+      },
+      required: ["path", "content"],
+      additionalProperties: false,
+    },
+  },
+  {
+    name: "run_command",
+    description:
+      "Run a shell command in the workspace and return its output. Requires the human to approve before it runs.",
+    risk: "write",
+    parameters: {
+      type: "object",
+      properties: {
+        command: { type: "string", description: "The command line to run." },
+      },
+      required: ["command"],
+      additionalProperties: false,
+    },
+  },
+  {
     name: "git_changes",
     description:
       "Uncommitted changes in the workspace: `git status` plus a diffstat. Pass full=true for the whole patch.",
@@ -169,6 +205,52 @@ function git(args: string[]): Promise<string> {
       else resolveOut(`git exited ${code}: ${(err || out).trim().slice(0, 500)}`);
     });
     setTimeout(() => child.kill(), 15_000);
+  });
+}
+
+/**
+ * Write a file inside the root. Creates parent directories, because a model
+ * asked to add `src/lib/thing.ts` should not have to mkdir first.
+ */
+function writeFileTool(path: string, content: string): string {
+  mkdirSync(dirname(path), { recursive: true });
+  const existed = existsSync(path);
+  writeFileSync(path, content, "utf8");
+  const lines = content.split("\n").length;
+  return `${existed ? "Replaced" : "Created"} ${relative(toolsRoot(), path)} (${lines} lines, ${content.length} bytes)`;
+}
+
+/**
+ * Run a command in the workspace.
+ *
+ * The human approved an exact command line, so that is what runs — re-parsing
+ * it into argv here could execute something subtly different from what they
+ * read. The safety property is the approval gate in `runTool`, not this
+ * function; it must never be reachable without one.
+ */
+function runCommand(command: string): Promise<string> {
+  return new Promise((resolveOut) => {
+    const child = spawn(command, {
+      cwd: toolsRoot(),
+      shell: true,
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+    let out = "";
+    child.stdout.on("data", (c: Buffer) => {
+      out += c.toString();
+    });
+    child.stderr.on("data", (c: Buffer) => {
+      out += c.toString();
+    });
+    const timer = setTimeout(() => child.kill(), 120_000);
+    child.on("error", (e) => {
+      clearTimeout(timer);
+      resolveOut(`command could not run: ${e.message}`);
+    });
+    child.on("close", (code) => {
+      clearTimeout(timer);
+      resolveOut(`exit ${code}\n${out.trim() || "(no output)"}`);
+    });
   });
 }
 
@@ -256,7 +338,69 @@ function readFileTool(path: string, startLine: number, limit: number): string {
  * Execute one tool call. Never throws: a model handles "that path does not
  * exist" far better than a turn that dies with a stack trace.
  */
-export async function runTool(name: string, args: Record<string, unknown>): Promise<string> {
+/** Who is running a tool, so a write can be attributed and approved. */
+export type ToolContext = {
+  userId: string;
+  conversationId: string;
+  /** Seat handle, for "@codex wants to run…". */
+  actor: string;
+};
+
+/** One-line risk summary shown in the approval prompt. */
+function approvalReason(name: string, args: Record<string, unknown>): string {
+  if (name === "write_file") return `Write ${String(args.path ?? "a file")} in your workspace`;
+  if (name === "run_command") return `Run: ${String(args.command ?? "").slice(0, 200)}`;
+  return `Run ${name}`;
+}
+
+export async function runTool(
+  name: string,
+  args: Record<string, unknown>,
+  ctx?: ToolContext,
+): Promise<string> {
+  const def = TOOL_DEFS.find((t) => t.name === name);
+  if (def?.risk === "write") {
+    // Without a context there is nobody to ask, and a tool that changes the
+    // workstation must never fall back to "allow". Refusing is the safe default
+    // and reads as a normal tool result to the model.
+    if (!ctx) return `${name} needs an approval, and this turn has no one to ask. Refused.`;
+
+    const { requestApproval } = await import("./approvals.server");
+    const outcome = await requestApproval({
+      userId: ctx.userId,
+      conversationId: ctx.conversationId,
+      actor: ctx.actor,
+      tool: name,
+      args,
+      reason: approvalReason(name, args),
+    });
+    if (!outcome.allowed) {
+      return outcome.scope === "timeout"
+        ? `${name} was not approved in time. Refused — ask again if it is still needed.`
+        : `${name} was declined by the human. Do not retry it; continue without it.`;
+    }
+  }
+
+  const started = Date.now();
+  logEvent({ kind: "tool:start", actor: name, message: `${name} ${JSON.stringify(args)}`, data: args });
+  const finish = (out: string, failed = false) => {
+    logEvent({
+      kind: failed ? "tool:error" : "tool:end",
+      actor: name,
+      message: failed ? out : `${name} returned ${out.length} chars`,
+      durationMs: Date.now() - started,
+      data: { preview: out.slice(0, 200) },
+    });
+    return out;
+  };
+  try {
+    return finish(await execute(name, args));
+  } catch (err) {
+    return finish(`${name} failed: ${err instanceof Error ? err.message : String(err)}`, true);
+  }
+}
+
+async function execute(name: string, args: Record<string, unknown>): Promise<string> {
   try {
     switch (name) {
       case "list_files":
@@ -269,6 +413,16 @@ export async function runTool(name: string, args: Record<string, unknown>): Prom
         const pattern = asString(args.pattern);
         if (!pattern) return "search_files needs a pattern.";
         return clip(searchFiles(pattern, safePath(asString(args.path, "."))));
+      }
+      case "write_file": {
+        const path = asString(args.path);
+        if (!path) return "write_file needs a path.";
+        return clip(writeFileTool(safePath(path), asString(args.content)));
+      }
+      case "run_command": {
+        const command = asString(args.command);
+        if (!command) return "run_command needs a command.";
+        return clip(await runCommand(command));
       }
       case "git_history": {
         const count = Math.min(Math.max(asNumber(args.count, 10), 1), 50);

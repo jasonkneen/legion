@@ -9,12 +9,15 @@ import { cn } from "@/lib/utils";
 export function Composer({
   seats,
   disabled,
+  queueing,
   placeholder,
   onSend,
   onAddSeat,
 }: {
   seats: Seat[];
   disabled?: boolean;
+  /** A seat is mid-turn: submitting adds to the queue instead of sending. */
+  queueing?: boolean;
   placeholder?: string;
   onSend: (text: string, askAll: boolean) => void;
   onAddSeat?: () => void;
@@ -161,7 +164,7 @@ export function Composer({
             size="icon-sm"
             onClick={submit}
             disabled={disabled || !value.trim()}
-            aria-label="Send"
+            aria-label={queueing ? "Add to queue" : "Send"}
             className="rounded-full"
           >
             <ArrowUp />
