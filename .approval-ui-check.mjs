@@ -42,8 +42,10 @@ for (let i = 0; i < 90; i += 1) {
 if (!appeared) {
   console.log("PANEL NEVER APPEARED (expected when the handle is not seated)");
   const articles = await p.locator("article").allInnerTexts();
-  console.log("messages after the ask:", articles.length);
-  articles.slice(-2).forEach((a) => console.log("  •", a.replace(/\n+/g, " | ").slice(0, 220)));
+  console.log("seat messages after the ask:", articles.length, "(0 means no rank spoke)");
+  const note = await p.locator("text=/not seated in this chat/").count();
+  console.log("system note shown:", note > 0);
+  if (note) console.log("  •", (await p.locator("text=/not seated in this chat/").first().innerText()).slice(0, 200));
   await b.close();
   process.exit(1);
 }
