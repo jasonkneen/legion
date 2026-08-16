@@ -113,7 +113,12 @@ export function AppShell({
   );
 
   return (
-    <div className="flex h-dvh overflow-hidden bg-bg text-fg">
+        // `fixed inset-0` rather than a plain full-height box: browser extensions
+    // append their own elements to <body>, and anything taller than nothing
+    // makes the document scroll — which drags the entire app up, header and
+    // sidebar included. Pinning the shell to the viewport means foreign content
+    // cannot move it. `h-dvh` stays as the sizing fallback.
+    <div className="app-shell fixed inset-0 flex h-dvh overflow-hidden bg-bg text-fg">
       <div className="hidden md:flex">
         <IconRail section={section} theme={theme} onToggleTheme={toggleTheme} />
         {section === "chat" && (
