@@ -227,46 +227,8 @@ export const addSeat = createServerFn({ method: "POST" })
   .middleware([authMiddleware])
   .validator((input: { conversationId: string } & NewSeatInput) => input)
   .handler(async ({ context, data }) => {
-    if (!isModelId(data.modelId)) throw new Error("Unknown model");
-    const convo = await ownedConversation(context.userId, data.conversationId);
-    if (!convo) throw new Error("Conversation not found");
-
-    const sql = await getSql();
-    const existing = await sql<{ handle: string; seat_order: number }>`
-      select handle, seat_order
-      from conversation_agents
-      where conversation_id = ${data.conversationId} and user_id = ${context.userId}
-    `;
-    if (existing.length >= 8) throw new Error("This chat is full (8 agents)");
-
-    const taken = new Set(existing.map((r) => r.handle));
-    const handle = uniqueHandle(data.handle || data.displayName || data.modelId, taken);
-    const seatOrder = existing.reduce((max, r) => Math.max(max, Number(r.seat_order)), -1) + 1;
-    const id = newId();
-    const displayName = data.displayName.trim() || handle;
-    const role = data.role.trim();
-
-    await sql`
-      insert into conversation_agents
-        (id, conversation_id, user_id, handle, display_name, model_id, role, seat_order)
-      values
-        (${id}, ${data.conversationId}, ${context.userId}, ${handle}, ${displayName}, ${data.modelId}, ${role}, ${seatOrder})
-    `;
-    await sql`
-      update conversations set updated_at = now()
-      where id = ${data.conversationId} and user_id = ${context.userId}
-    `;
-
-    return {
-      id,
-      conversationId: data.conversationId,
-      handle,
-      displayName,
-      modelId: data.modelId,
-      role,
-      seatOrder,
-      createdAt: new Date().toISOString(),
-    } satisfies Seat;
+    const { seatAgent } = await import("./seats.server");
+    return seatAgent(context.userId, data.conversationId, data);
   });
 
 export const removeSeat = createServerFn({ method: "POST" })

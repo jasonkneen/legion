@@ -280,12 +280,13 @@ describe("activity history", () => {
   });
 });
 
-describe("the grok seat cannot write", () => {
+describe("grok never writes with its own tools", () => {
   test("nothing in its allowlist touches the workstation", async () => {
     const cli = await server.ssrLoadModule("/src/lib/chat/local-cli.server.ts");
     // Not a style rule: grok reads its permission mode from the workstation's
-    // own config, and "always-approve" there means a write tool would run
-    // unattended — it has no way to ask. See GROK_DENY_RULES for the measurement.
+    // own config, and "always-approve" there means its own write tool would run
+    // unattended — it has no way to ask. It writes through Legion's MCP tools
+    // instead, which gate themselves. See GROK_DENY_RULES for the measurement.
     const writes = cli.GROK_READONLY_TOOLS.filter((t) =>
       /write|edit|replace|terminal|command|exec|delete|move/i.test(t),
     );
@@ -301,18 +302,19 @@ describe("the grok seat cannot write", () => {
 });
 
 describe("seat reach", () => {
-  test("says read-only for grok, and why", async () => {
+  test("grok writes only through Legion's tools", async () => {
     const reach = await server.ssrLoadModule("/src/lib/chat/reach.server.ts");
     const cli = await server.ssrLoadModule("/src/lib/chat/local-cli.server.ts");
     const keys = await server.ssrLoadModule("/src/lib/chat/keys.server.ts");
-    // Only meaningful when grok is actually the route; otherwise the API seat
-    // answer (which can write) is the correct one.
     if (!keys.localCliFor("xai")) return;
     const r = await reach.seatReach("test-user", "xai");
     if (r.route !== "cli") return;
-    assert.equal(r.canWrite, false);
-    assert.deepEqual(r.writes, []);
-    assert.match(r.note, /permission|auto-approve/i);
+
+    // It can write — but never with its own tools, which is the whole point:
+    // grok cannot ask a human, so it does not get to decide.
+    assert.equal(r.canWrite, true);
+    assert.deepEqual(r.writes, ["write_file", "run_command"]);
+    assert.match(r.note, /cannot ask permission|switched off/i);
     // Derived, not retyped: the displayed reads come from the run path's list.
     for (const tool of r.reads) assert.ok(cli.GROK_READONLY_TOOLS.includes(tool));
   });
@@ -521,6 +523,68 @@ describe("deleting a chamber releases what it was holding", () => {
     assert.equal(approvals.pendingApprovals("kept-room").length, 1, "an unrelated prompt must survive");
     await approvals.decideApproval(keep.userId, asked.id, "deny");
     await call;
+  });
+});
+
+describe("a seat can bring in another agent", () => {
+  const room = { userId: "test-user", conversationId: "seating-room", actor: "grok" };
+
+  before(async () => {
+    const { getSql } = await server.ssrLoadModule("/src/lib/db.ts");
+    const sql = await getSql();
+    await sql`insert into conversations (id, user_id, title) values ('seating-room', 'test-user', 'Seating')
+              on conflict (id) do nothing`;
+  });
+
+  test("adding one asks the human first", async () => {
+    // Seating a rank spends the human's money on a model they did not choose,
+    // so it belongs behind the same gate as writing to their disk.
+    const ranks = await server
+      .ssrLoadModule("/src/lib/chat/seats.server.ts")
+      .then((m) => m.availableRanks(room.userId, room.conversationId));
+    const target = ranks.find((r) => r.configured && !r.seated);
+    if (!target) return; // nothing configured in this environment
+
+    const call = tools.runTool("add_seat", { modelId: target.modelId, role: "Second opinion" }, room);
+    const pending = await waitForApproval("seating-room");
+    assert.equal(pending.tool, "add_seat");
+    assert.match(pending.reason, /bring/i);
+    await approvals.decideApproval(room.userId, pending.id, "once");
+    assert.match(await call, /is now in this chat/i);
+  });
+
+  test("a declined one seats nobody", async () => {
+    const seats = await server.ssrLoadModule("/src/lib/chat/seats.server.ts");
+    const before = await seats.availableRanks(room.userId, room.conversationId);
+    const target = before.find((r) => r.configured && !r.seated);
+    if (!target) return;
+
+    const call = tools.runTool("add_seat", { modelId: target.modelId, role: "Nope" }, room);
+    await approvals.decideApproval(room.userId, (await waitForApproval("seating-room")).id, "deny");
+    await call;
+    const after = await seats.availableRanks(room.userId, room.conversationId);
+    assert.equal(after.find((r) => r.modelId === target.modelId)?.seated, false);
+  });
+
+  test("refuses a rank that has no credential, rather than seating something mute", async () => {
+    const seats = await server.ssrLoadModule("/src/lib/chat/seats.server.ts");
+    const ranks = await seats.availableRanks(room.userId, room.conversationId);
+    const mute = ranks.find((r) => !r.configured);
+    if (!mute) return;
+    // Refused before the approval, so the human is not asked about a dud.
+    const out = await tools.runTool("add_seat", { modelId: mute.modelId, role: "x" }, room);
+    assert.match(out, /no working credential/i);
+    assert.equal(approvals.pendingApprovals("seating-room").length, 0);
+  });
+
+  test("an unknown rank is reported, not invented", async () => {
+    const out = await tools.runTool("add_seat", { modelId: "gpt-9-imaginary", role: "x" }, room);
+    assert.match(out, /no rank called/i);
+  });
+
+  test("list_ranks says who is available and who is already here", async () => {
+    const out = await tools.runTool("list_ranks", {}, room);
+    assert.match(out, /available|already seated|no credential/);
   });
 });
 

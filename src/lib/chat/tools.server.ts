@@ -17,6 +17,16 @@ import { logEvent } from "@/lib/log.server";
 /** Most tool calls one turn may make before we stop feeding results back. */
 export const MAX_TOOL_CALLS = 12;
 
+/**
+ * The tools that are about the chat rather than the workspace.
+ *
+ * A CLI seat brings its own file and shell tools; what it cannot have is a view
+ * of the room — the shared plan, who could be brought in, and the means to
+ * bring them. This is the set Legion lends such a seat, and the reason a Codex
+ * seat is not handed a second `write_file` it does not need.
+ */
+export const ROOM_TOOLS = ["list_ranks", "add_seat", "todo_write", "ask_human", "ask_seat"];
+
 /** Ceiling on a single tool result, in characters. */
 const MAX_RESULT_CHARS = 8_000;
 
@@ -32,6 +42,16 @@ export type ToolDef = {
    * `approvals.server.ts`.
    */
   risk?: "read" | "write";
+  /**
+   * Checked before the approval gate. Return a message to refuse the call
+   * outright, or null to let it proceed.
+   *
+   * The gate is the expensive step — it stops the turn and waits on a human —
+   * so anything knowably wrong should be caught first. Asking someone to
+   * approve seating an agent that has no credential wastes their attention on a
+   * call that was always going to fail.
+   */
+  precheck?: (args: Record<string, unknown>, ctx: ToolContext) => Promise<string | null>;
   /** JSON Schema for the arguments object. */
   parameters: {
     type: "object";
@@ -184,6 +204,49 @@ export const TOOL_DEFS: ToolDef[] = [
         request: { type: "string", description: "Exactly what you need them to do, in one or two sentences." },
       },
       required: ["handle", "request"],
+      additionalProperties: false,
+    },
+  },
+  {
+    name: "list_ranks",
+    description:
+      "List the agents that could be brought into this chat: which model each is, whether it has a working "
+      + "credential, and whether it is already seated. Check this before asking for one.",
+    parameters: {
+      type: "object",
+      properties: {},
+      required: [],
+      additionalProperties: false,
+    },
+  },
+  {
+    name: "add_seat",
+    description:
+      "Bring another agent into this chat, so it can answer for itself from here on. Use it when the work needs a "
+      + "capability no one seated has — a different model's judgement, a CLI's tools, a second opinion. The human is "
+      + "asked first. For a one-off question to someone already seated, use ask_seat instead.",
+    risk: "write",
+    precheck: async (args, ctx) => {
+      const modelId = typeof args.modelId === "string" ? args.modelId.trim() : "";
+      if (!modelId) return "add_seat needs a modelId. Call list_ranks to see what there is.";
+      const { availableRanks } = await import("./seats.server");
+      const rank = (await availableRanks(ctx.userId, ctx.conversationId)).find((r) => r.modelId === modelId);
+      if (!rank) return `There is no rank called ${modelId}. Call list_ranks for the list.`;
+      if (rank.seated) return `${rank.name} is already in this chat.`;
+      if (!rank.configured) {
+        return `${rank.name} has no working credential, so it would sit there mute. Tell the human that rather than seating it.`;
+      }
+      return null;
+    },
+    parameters: {
+      type: "object",
+      properties: {
+        modelId: { type: "string", description: "Which rank, from list_ranks, e.g. claude or gemini." },
+        handle: { type: "string", description: "Short @handle for them in this chat. Optional." },
+        displayName: { type: "string", description: "Name shown on their messages. Optional." },
+        role: { type: "string", description: "One line on why they are here and what they own." },
+      },
+      required: ["modelId", "role"],
       additionalProperties: false,
     },
   },
@@ -470,6 +533,7 @@ async function mcpToolIsReadOnly(userId: string | undefined, qualifiedName: stri
 function approvalReason(name: string, args: Record<string, unknown>): string {
   if (name === "write_file") return `Write ${String(args.path ?? "a file")} in your workspace`;
   if (name === "run_command") return `Run: ${String(args.command ?? "").slice(0, 200)}`;
+  if (name === "add_seat") return `Bring ${String(args.modelId ?? "another agent")} into this chat`;
   if (name.startsWith("mcp__")) {
     const [, server, ...rest] = name.split("__");
     return `Run ${rest.join("__")} on the ${server} MCP server`;
@@ -489,6 +553,14 @@ export async function runTool(
   // because an unknown tool from a third party is the last thing to trust by
   // default.
   const isMcp = name.startsWith("mcp__");
+
+  // Before anything is asked of a human: give the tool a chance to say this
+  // call cannot work.
+  if (def?.precheck && ctx) {
+    const refusal = await def.precheck(args, ctx).catch(() => null);
+    if (refusal) return refusal;
+  }
+
   const needsApproval = def?.risk === "write" || (isMcp && !(await mcpToolIsReadOnly(ctx?.userId, name)));
 
   if (needsApproval) {
@@ -572,6 +644,46 @@ async function execute(name: string, args: Record<string, unknown>, ctx?: ToolCo
         if (!command) return "run_command needs a command.";
         return clip(await runCommand(command));
       }
+      case "list_ranks": {
+        if (!ctx) return "list_ranks needs a live conversation.";
+        const { availableRanks } = await import("./seats.server");
+        const ranks = await availableRanks(ctx.userId, ctx.conversationId);
+        const lines = ranks.map((r) => {
+          const state = r.seated ? "already seated" : r.configured ? "available" : "no credential";
+          return `${r.modelId} — ${r.name} (${r.vendor}) — ${state} — ${r.blurb}`;
+        });
+        return lines.join("\n");
+      }
+
+      case "add_seat": {
+        if (!ctx) return "add_seat needs a live conversation.";
+        const modelId = asString(args.modelId);
+        if (!modelId) return "add_seat needs a modelId. Call list_ranks to see what there is.";
+        const { seatAgent, availableRanks } = await import("./seats.server");
+
+        // Seating a rank with no credential produces a seat that cannot speak,
+        // which reads to the human as the app being broken.
+        const ranks = await availableRanks(ctx.userId, ctx.conversationId);
+        const rank = ranks.find((r) => r.modelId === modelId);
+        if (!rank) return `There is no rank called ${modelId}. Call list_ranks for the list.`;
+        if (rank.seated) return `${rank.name} is already in this chat.`;
+        if (!rank.configured) {
+          return `${rank.name} has no working credential, so it would sit there mute. Tell the human that rather than seating it.`;
+        }
+
+        try {
+          const seat = await seatAgent(ctx.userId, ctx.conversationId, {
+            modelId: modelId as never,
+            handle: asString(args.handle),
+            displayName: asString(args.displayName) || rank.name,
+            role: asString(args.role),
+          });
+          return `@${seat.handle} (${rank.name}) is now in this chat. Address them by handle; they answer for themselves.`;
+        } catch (err) {
+          return `That seat could not be added: ${err instanceof Error ? err.message : String(err)}`;
+        }
+      }
+
       case "ask_seat": {
         if (!ctx) return "ask_seat needs a live conversation.";
         const handle = asString(args.handle);

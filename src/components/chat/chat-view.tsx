@@ -155,6 +155,20 @@ export function ChatView({
     setQuestions(pulse.questions);
   }, [sending, pulse]);
 
+  // A seat can arrive mid-turn: an agent may decide the work needs someone it
+  // cannot be, and add them. Follow the server's list rather than only the
+  // additions this browser made itself.
+  useEffect(() => {
+    const arrived = pulse?.seats;
+    if (!arrived?.length) return;
+    setSeats((prev) => {
+      const known = new Set(prev.map((s) => s.id));
+      const added = arrived.filter((s) => !known.has(s.id));
+      if (!added.length) return prev;
+      return [...prev, ...added].sort((a, b) => a.seatOrder - b.seatOrder);
+    });
+  }, [pulse]);
+
   const decideApprovalRequest = async (id: string, scope: ApprovalScope) => {
     setApprovals((rows) => rows.filter((r) => r.id !== id));
     await answerApproval({ data: { id, scope } }).catch(() => {

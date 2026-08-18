@@ -7,6 +7,8 @@ import { pendingQuestions, type PendingQuestion } from "./questions.server";
 import { loadTodos, type TodoItem } from "./todos.server";
 import { workspaceChanges, type FileChange } from "./tools.server";
 import type { ActivityEvent } from "./activity-actions";
+import type { ModelId } from "@/lib/models";
+import type { Seat } from "./types";
 
 /**
  * Everything the chat polls for, in one answer.
@@ -22,6 +24,12 @@ import type { ActivityEvent } from "./activity-actions";
  * actually showing.
  */
 export type ChamberPulse = {
+  /**
+   * Who is in the room. A seat can now be added mid-turn by an agent that
+   * decided the work needed someone else, so the rail cannot be a snapshot
+   * taken when the chamber opened.
+   */
+  seats: Seat[];
   approvals: PendingApprovalView[];
   questions: PendingQuestion[];
   todos: TodoItem[];
@@ -35,7 +43,7 @@ export const chamberPulse = createServerFn({ method: "GET" })
   .validator((input: { conversationId: string; activity?: boolean; changes?: boolean }) => input)
   .handler(async ({ data, context }): Promise<ChamberPulse> => {
     const { conversationId } = data;
-    if (!conversationId) return { approvals: [], questions: [], todos: [] };
+    if (!conversationId) return { seats: [], approvals: [], questions: [], todos: [] };
 
     // Activity is persisted now, so a chamber id alone is no longer proof of
     // ownership the way an in-memory ring was.
@@ -44,9 +52,36 @@ export const chamberPulse = createServerFn({ method: "GET" })
       select id from conversations
       where id = ${conversationId} and user_id = ${context.userId} limit 1
     `;
-    if (!owned.length) return { approvals: [], questions: [], todos: [] };
+    if (!owned.length) return { seats: [], approvals: [], questions: [], todos: [] };
+
+    const seatRows = await sql<{
+      id: string;
+      conversation_id: string;
+      handle: string;
+      display_name: string;
+      model_id: string;
+      role: string;
+      seat_order: number;
+      created_at: string;
+    }>`
+      select id, conversation_id, handle, display_name, model_id, role, seat_order,
+             created_at::text as created_at
+      from conversation_agents
+      where conversation_id = ${conversationId} and user_id = ${context.userId}
+      order by seat_order asc, created_at asc
+    `;
 
     const pulse: ChamberPulse = {
+      seats: seatRows.map((r) => ({
+        id: r.id,
+        conversationId: r.conversation_id,
+        handle: r.handle,
+        displayName: r.display_name,
+        modelId: r.model_id as ModelId,
+        role: r.role,
+        seatOrder: Number(r.seat_order),
+        createdAt: r.created_at,
+      })),
       approvals: pendingApprovals(conversationId).map(toApprovalView),
       questions: pendingQuestions(conversationId),
       todos: await loadTodos(conversationId),

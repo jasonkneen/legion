@@ -14,6 +14,7 @@ import { Route as DiscoverRouteImport } from './routes/discover'
 import { Route as LoginRouteImport } from './routes/login'
 import { Route as SettingsRouteImport } from './routes/settings'
 import { Route as ApiReplyRouteImport } from './routes/api/reply'
+import { Route as ApiSeatToolsRouteImport } from './routes/api/seat-tools'
 import { Route as CIdRouteImport } from './routes/c.$id'
 import { Route as ApiAuthSplatRouteImport } from './routes/api/auth/$'
 
@@ -42,6 +43,11 @@ const ApiReplyRoute = ApiReplyRouteImport.update({
   path: '/api/reply',
   getParentRoute: () => rootRouteImport,
 } as any)
+const ApiSeatToolsRoute = ApiSeatToolsRouteImport.update({
+  id: '/api/seat-tools',
+  path: '/api/seat-tools',
+  getParentRoute: () => rootRouteImport,
+} as any)
 const CIdRoute = CIdRouteImport.update({
   id: '/c/$id',
   path: '/c/$id',
@@ -59,6 +65,7 @@ export interface FileRoutesByFullPath {
   '/login': typeof LoginRoute
   '/settings': typeof SettingsRoute
   '/api/reply': typeof ApiReplyRoute
+  '/api/seat-tools': typeof ApiSeatToolsRoute
   '/c/$id': typeof CIdRoute
   '/api/auth/$': typeof ApiAuthSplatRoute
 }
@@ -68,6 +75,7 @@ export interface FileRoutesByTo {
   '/login': typeof LoginRoute
   '/settings': typeof SettingsRoute
   '/api/reply': typeof ApiReplyRoute
+  '/api/seat-tools': typeof ApiSeatToolsRoute
   '/c/$id': typeof CIdRoute
   '/api/auth/$': typeof ApiAuthSplatRoute
 }
@@ -78,6 +86,7 @@ export interface FileRoutesById {
   '/login': typeof LoginRoute
   '/settings': typeof SettingsRoute
   '/api/reply': typeof ApiReplyRoute
+  '/api/seat-tools': typeof ApiSeatToolsRoute
   '/c/$id': typeof CIdRoute
   '/api/auth/$': typeof ApiAuthSplatRoute
 }
@@ -89,6 +98,7 @@ export interface FileRouteTypes {
     | '/login'
     | '/settings'
     | '/api/reply'
+    | '/api/seat-tools'
     | '/c/$id'
     | '/api/auth/$'
   fileRoutesByTo: FileRoutesByTo
@@ -98,6 +108,7 @@ export interface FileRouteTypes {
     | '/login'
     | '/settings'
     | '/api/reply'
+    | '/api/seat-tools'
     | '/c/$id'
     | '/api/auth/$'
   id:
@@ -107,6 +118,7 @@ export interface FileRouteTypes {
     | '/login'
     | '/settings'
     | '/api/reply'
+    | '/api/seat-tools'
     | '/c/$id'
     | '/api/auth/$'
   fileRoutesById: FileRoutesById
@@ -117,6 +129,7 @@ export interface RootRouteChildren {
   LoginRoute: typeof LoginRoute
   SettingsRoute: typeof SettingsRoute
   ApiReplyRoute: typeof ApiReplyRoute
+  ApiSeatToolsRoute: typeof ApiSeatToolsRoute
   CIdRoute: typeof CIdRoute
   ApiAuthSplatRoute: typeof ApiAuthSplatRoute
 }
@@ -158,6 +171,13 @@ declare module '@tanstack/react-router' {
       preLoaderRoute: typeof ApiReplyRouteImport
       parentRoute: typeof rootRouteImport
     }
+    '/api/seat-tools': {
+      id: '/api/seat-tools'
+      path: '/api/seat-tools'
+      fullPath: '/api/seat-tools'
+      preLoaderRoute: typeof ApiSeatToolsRouteImport
+      parentRoute: typeof rootRouteImport
+    }
     '/c/$id': {
       id: '/c/$id'
       path: '/c/$id'
@@ -181,6 +201,7 @@ const rootRouteChildren: RootRouteChildren = {
   LoginRoute: LoginRoute,
   SettingsRoute: SettingsRoute,
   ApiReplyRoute: ApiReplyRoute,
+  ApiSeatToolsRoute: ApiSeatToolsRoute,
   CIdRoute: CIdRoute,
   ApiAuthSplatRoute: ApiAuthSplatRoute,
 }
