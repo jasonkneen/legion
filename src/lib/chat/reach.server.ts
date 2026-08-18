@@ -1,6 +1,6 @@
 import { PROVIDER_BY_ID, type ProviderId } from "@/lib/providers";
 import { localCliFor, resolveCreds } from "./keys.server";
-import { GROK_READONLY_TOOLS } from "./local-cli.server";
+import { GROK_READONLY_TOOLS, HERMES_TOOLSETS, PI_SEAT_TOOLS } from "./local-cli.server";
 import { TOOL_DEFS } from "./tools.server";
 import type { LocalCliId } from "./local-cli.server";
 
@@ -105,6 +105,35 @@ export async function seatReach(userId: string, provider: ProviderId): Promise<S
       note:
         "grok cannot ask permission itself, so its own file and shell tools are switched off. " +
         "It writes through Legion's tools instead, which stop and ask you first.",
+    };
+  }
+
+  if (cli === "pi") {
+    return {
+      provider,
+      route: "cli",
+      cli,
+      reads: [...PI_SEAT_TOOLS.filter((t) => t !== "mcp"), "its own skills"],
+      writes: ["write_file", "run_command"],
+      canWrite: true,
+      note:
+        "pi keeps its own read-only tools and skills. It cannot ask permission itself, so its writers are " +
+        "switched off and anything that changes your machine goes through Legion's tools, which ask you first.",
+    };
+  }
+
+  if (cli === "hermes") {
+    return {
+      provider,
+      route: "cli",
+      cli,
+      reads: [...HERMES_TOOLSETS],
+      writes: [],
+      canWrite: false,
+      note:
+        "hermes has its own web, skills, planning and clarifying tools. Its terminal, code-execution and " +
+        "file toolsets are off: it cannot ask permission, and it takes no per-turn MCP config, so there is " +
+        "no gated way to let it write.",
     };
   }
 

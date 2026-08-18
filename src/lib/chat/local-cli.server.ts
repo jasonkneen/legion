@@ -63,10 +63,16 @@ const ENV_OVERRIDE: Record<LocalCliId, string> = {
  * seat must not edit the workstation without a prompt the human can see.
  */
 type SimpleCliSpec = {
-  /** Build argv for a single-shot run. */
-  args: (prompt: string, system: string, model: string) => string[];
+  /**
+   * Build argv for a single-shot run. `mcpConfig` is a path to a generated MCP
+   * config when this turn has a human to approve things, and empty when it does
+   * not — a seat with nobody to ask gets nothing that writes.
+   */
+  args: (prompt: string, system: string, model: string, mcpConfig: string) => string[];
   /** Pull the answer out of stdout. */
   parse: (stdout: string) => string;
+  /** True when this CLI can be handed Legion's tools through the bridge. */
+  bridge?: boolean;
 };
 
 /** Last assistant text in pi's NDJSON stream. */
@@ -93,15 +99,40 @@ function parsePiOutput(stdout: string): string {
   return text.trim();
 }
 
+/**
+ * The tools a pi seat may use.
+ *
+ * `--tools` is an allowlist, so `write`, `edit`, `bash` and pi's extension
+ * tools are absent rather than discouraged. Skills stay on: they are how a pi
+ * seat knows what its owner taught it, and a skill can do no more than the
+ * tools allow.
+ *
+ * `mcp` is how pi reaches an MCP server at all — it does not surface each
+ * remote tool by name, so without this entry Legion's tools are invisible to
+ * it and the seat can only read. That is also why the allowlist matters twice
+ * over: `mcp` is a door, and the only server behind it is ours.
+ */
+export const PI_SEAT_TOOLS = ["read", "grep", "find", "ls", "mcp"];
+
+/** Hermes toolsets a chat seat may have. Measured against `hermes tools list`. */
+export const HERMES_TOOLSETS = ["web", "skills", "todo", "clarify"];
+
 const SIMPLE_CLIS: Partial<Record<LocalCliId, SimpleCliSpec>> = {
   pi: {
-    args: (prompt, system, model) => [
+    // pi keeps its own read-only tools and its skills. It cannot route a
+    // permission request back to us, so nothing of its own may write: the
+    // allowlist is the enforcement, and anything that changes the workstation
+    // comes from Legion's tools over the bridge, which stop for a human inside
+    // this process.
+    bridge: true,
+    args: (prompt, system, model, mcpConfig) => [
       "-p",
       "--mode",
       "json",
-      // No tools: pi cannot route a permission request back to us.
-      "--no-tools",
       "--no-session",
+      "--tools",
+      PI_SEAT_TOOLS.join(","),
+      ...(mcpConfig ? ["--mcp-config", mcpConfig] : []),
       ...(system ? ["--system-prompt", system] : []),
       ...(model ? ["--model", model] : []),
       prompt,
@@ -109,10 +140,17 @@ const SIMPLE_CLIS: Partial<Record<LocalCliId, SimpleCliSpec>> = {
     parse: parsePiOutput,
   },
   hermes: {
+    // Hermes ships with far more than a chat seat should hold — terminal, code
+    // execution, browser automation, cron jobs, home automation — and no way to
+    // ask before using any of it. The toolset list is the whole safety story
+    // here, so it names what a seat may have rather than what it may not:
+    // reading the web, its own skills, planning, and asking a question.
     args: (prompt, system, model) => [
       "-z",
       system ? `${system}\n\n---\n\n${prompt}` : prompt,
       "--safe-mode",
+      "-t",
+      HERMES_TOOLSETS.join(","),
       ...(model ? ["-m", model] : []),
     ],
     // Plain text on stdout.
@@ -435,9 +473,30 @@ export async function completeWithSimpleCli(
 
   const { system, prompt } = renderPrompt(messages);
   const started = Date.now();
-  logEvent({ kind: "cli:spawn", actor: cli, conversationId: ctx?.conversationId, message: `${cli} single-shot` });
 
-  const child = spawn(bin, spec.args(prompt, system, model), { stdio: ["ignore", "pipe", "pipe"] });
+  // Legion's tools, for the CLIs that can be pointed at an MCP server. They run
+  // in this process and stop for a human, which is what lets a seat that has no
+  // permission channel of its own still change something.
+  let token = "";
+  let mcpConfig = "";
+  let disposeConfig: (() => void) | null = null;
+  if (ctx && spec.bridge) {
+    const { mintSeatGrant } = await import("./seat-grant.server");
+    const { writeBridgeConfig } = await import("./agent-home.server");
+    token = mintSeatGrant(ctx, "all");
+    const written = writeBridgeConfig(cli, token, legionUrl());
+    mcpConfig = written.path;
+    disposeConfig = written.dispose;
+  }
+
+  logEvent({
+    kind: "cli:spawn",
+    actor: cli,
+    conversationId: ctx?.conversationId,
+    message: mcpConfig ? `${cli} single-shot (Legion tools attached)` : `${cli} single-shot`,
+  });
+
+  const child = spawn(bin, spec.args(prompt, system, model, mcpConfig), { stdio: ["ignore", "pipe", "pipe"] });
   let stdout = "";
   let stderr = "";
   child.stdout.on("data", (c: Buffer) => {
@@ -451,7 +510,15 @@ export async function completeWithSimpleCli(
   const code = await new Promise<number | null>((resolveExit, reject) => {
     child.on("error", reject);
     child.on("close", resolveExit);
-  }).finally(() => clearTimeout(timer));
+  }).finally(async () => {
+    clearTimeout(timer);
+    // The token and the file it lives in die with the turn.
+    disposeConfig?.();
+    if (token) {
+      const { revokeSeatGrant } = await import("./seat-grant.server");
+      revokeSeatGrant(token);
+    }
+  });
 
   logEvent({
     kind: "cli:exit",

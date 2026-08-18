@@ -588,6 +588,29 @@ describe("a seat can bring in another agent", () => {
   });
 });
 
+describe("pi and hermes keep their own tools, not their own writers", () => {
+  test("pi's allowlist has no writer in it", async () => {
+    const cli = await server.ssrLoadModule("/src/lib/chat/local-cli.server.ts");
+    // pi cannot ask a human, so the allowlist is the enforcement. `mcp` is in
+    // it deliberately: it is the only door to Legion's gated tools, and ours is
+    // the only server behind it.
+    for (const tool of cli.PI_SEAT_TOOLS) {
+      assert.ok(!/write|edit|bash|exec|delete|move/i.test(tool), `${tool} can change the workstation`);
+    }
+    assert.ok(cli.PI_SEAT_TOOLS.includes("mcp"), "without mcp, Legion's tools are invisible to pi");
+  });
+
+  test("hermes gets its own tools, but nothing that runs or writes", async () => {
+    const cli = await server.ssrLoadModule("/src/lib/chat/local-cli.server.ts");
+    // Measured against `hermes tools list`: it ships with terminal, code
+    // execution, browser automation and cron among others, and no way to ask.
+    for (const banned of ["terminal", "code_execution", "browser", "cronjob", "file", "delegation"]) {
+      assert.ok(!cli.HERMES_TOOLSETS.includes(banned), `${banned} must not be given to a seat`);
+    }
+    assert.ok(cli.HERMES_TOOLSETS.includes("skills"), "a hermes seat should still know its own skills");
+  });
+});
+
 describe("question parsing", () => {
   test("accepts a bare object instead of an array", () => {
     const parsed = questions.parseQuestions({

@@ -1,5 +1,5 @@
-import { existsSync, mkdirSync, readFileSync, symlinkSync, writeFileSync } from "node:fs";
-import { homedir } from "node:os";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import { dataDir } from "@/lib/data-dir";
 
@@ -107,4 +107,29 @@ export function codexHome(): string {
 # to be merged with it.
 `,
   );
+}
+
+/**
+ * An MCP config file pointing a CLI at Legion's bridge for one turn.
+ *
+ * For CLIs that take a config path rather than a home of their own. The token
+ * is written into the file, so the file is per-turn and removed with it.
+ */
+export function writeBridgeConfig(
+  cli: string,
+  token: string,
+  legionUrl: string,
+): { path: string; dispose: () => void } {
+  const { command, args } = bridgeCommand();
+  const dir = mkdtempSync(join(tmpdir(), `legion-${cli}-`));
+  const path = join(dir, "mcp.json");
+  writeFileSync(
+    path,
+    JSON.stringify(
+      { mcpServers: { legion: { command, args, env: { LEGION_URL: legionUrl, LEGION_SEAT_TOKEN: token } } } },
+      null,
+      2,
+    ),
+  );
+  return { path, dispose: () => rmSync(dir, { recursive: true, force: true }) };
 }
