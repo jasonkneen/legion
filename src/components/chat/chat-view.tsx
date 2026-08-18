@@ -16,6 +16,7 @@ import { usePulse } from "@/lib/chat/use-pulse";
 import type { ApprovalScope, PendingApprovalView } from "@/lib/chat/approvals.server";
 import { MessageItem } from "@/components/chat/message-item";
 import { SeatRail } from "@/components/chat/seat-rail";
+import { MessageDial } from "@/components/chat/message-dial";
 import { SeatAvatar } from "@/components/seat-avatar";
 import { streamReply } from "@/lib/chat/stream-reply";
 import {
@@ -487,6 +488,8 @@ export function ChatView({
         </div>
       )}
 
+      <div className="relative flex min-h-0 flex-1">
+      <MessageDial messages={messages} seats={seats} scroller={scroller} />
       <div ref={scroller} className="min-h-0 flex-1 overflow-y-auto px-3 py-6 md:px-6">
         {loading ? (
           <div className="mx-auto max-w-2xl space-y-4">
@@ -505,8 +508,9 @@ export function ChatView({
             </p>
           </div>
         ) : (
-          messages.map((message) =>
-            message.task === "missing-key" ? (
+          messages.map((message) => (
+            <div key={message.id} data-msg={message.id}>
+            {message.task === "missing-key" ? (
               <div
                 key={message.id}
                 className="mx-auto my-3 flex w-full max-w-2xl items-center gap-2 rounded-xl border border-border bg-bg-elevated px-3 py-2.5 text-sm"
@@ -554,8 +558,9 @@ export function ChatView({
                   void send(prompt, false, { targetHandles: [handle], task })
                 }
               />
-            ),
-          )
+            )}
+            </div>
+          ))
         )}
         {workingSeat && (
           <article className="mx-auto w-full max-w-2xl px-1 py-4">
@@ -583,6 +588,7 @@ export function ChatView({
             </div>
           </article>
         )}
+      </div>
       </div>
 
       <div className="px-3 pt-1 pb-[max(1rem,env(safe-area-inset-bottom))] md:px-6">
