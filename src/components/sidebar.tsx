@@ -2,6 +2,7 @@ import { Link } from "@tanstack/react-router";
 import { MessageSquarePlus, Trash2, Users } from "lucide-react";
 import { BrandMark, BrandWord } from "@/components/brand";
 import { Button } from "@/components/ui/button";
+import { SeatAvatar } from "@/components/seat-avatar";
 import type { Conversation } from "@/lib/chat/types";
 import { SEAT_PRESETS, type StoredAssistant } from "@/lib/models";
 import { cn, relativeTime } from "@/lib/utils";
@@ -100,9 +101,7 @@ export function Sidebar({
                 onClick={() => onOpenAssistant(a.id)}
                 className="flex w-full items-center gap-2 rounded-lg px-2.5 py-1.5 text-left hover:bg-bg-subtle disabled:opacity-60"
               >
-                <span className="grid size-7 place-items-center rounded-lg bg-bg-subtle text-[10px] font-semibold">
-                  {a.name.slice(0, 1)}
-                </span>
+                <SeatAvatar modelId={a.modelId} name={a.name} size="sm" />
                 <span className="min-w-0">
                   <span className="block truncate text-[13px] font-medium">{a.name}</span>
                   <span className="block truncate text-[11px] text-fg-subtle">{a.tag}</span>
