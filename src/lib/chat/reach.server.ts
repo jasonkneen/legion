@@ -97,12 +97,14 @@ export async function seatReach(userId: string, provider: ProviderId): Promise<S
       route: "cli",
       cli,
       reads: GROK_READONLY_TOOLS.filter((t) => t !== "todo_write"),
-      writes: [],
-      canWrite: false,
-      // The measurement behind this is recorded on GROK_DENY_RULES.
+      writes: ["write_file", "run_command"],
+      canWrite: true,
+      // grok has no way to ask permission itself, so it does not get to decide.
+      // Its own writers are off and Legion lends it ours over MCP; those run in
+      // the server, where the approval prompt comes from. See GROK_DENY_RULES.
       note:
-        "Read-only: grok has no way to ask permission mid-turn, and this machine's grok config " +
-        "auto-approves, so its write tools are denied outright rather than trusted.",
+        "grok cannot ask permission itself, so its own file and shell tools are switched off. " +
+        "It writes through Legion's tools instead, which stop and ask you first.",
     };
   }
 

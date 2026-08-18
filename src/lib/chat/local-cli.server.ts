@@ -18,8 +18,9 @@ import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { accessSync, constants } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
-import { MAX_TOOL_CALLS, toolsRoot, type ToolContext } from "./tools.server";
+import { MAX_TOOL_CALLS, runTool, toolsRoot, type ToolContext } from "./tools.server";
 import { logEvent } from "@/lib/log.server";
+import { codexHome, grokHome } from "./agent-home.server";
 import type { ProviderMessage } from "./xai.server";
 
 export type LocalCliId = "claude" | "codex" | "grok" | "pi" | "hermes" | "qwen";
@@ -319,7 +320,7 @@ export async function completeWithClaudeCli(
         // Publishing a plan touches nothing on disk, so it is pre-approved
         // rather than parked — asking a human to confirm a to-do list would be
         // noise, and the plan is visible in the panel the moment it lands.
-        allowedTools: ctx ? [...CLAUDE_READONLY_TOOLS, LEGION_PLAN_TOOL] : CLAUDE_READONLY_TOOLS,
+        allowedTools: ctx ? [...CLAUDE_READONLY_TOOLS, ...LEGION_MCP_TOOLS] : CLAUDE_READONLY_TOOLS,
         ...(ctx ? { canUseTool: claudeApprovalBridge(ctx) } : {}),
         settingSources: [],
         // The user's MCP servers, handed to Claude Code directly rather than
@@ -473,8 +474,23 @@ export async function completeWithSimpleCli(
  * every request bouncing through Legion. A malformed entry is skipped rather
  * than failing the turn.
  */
-/** The tool name Claude Code sees for our own plan tool. */
-const LEGION_PLAN_TOOL = "mcp__legion__publish_plan";
+/**
+ * The tools Legion supplies to the Claude seat, under its own MCP server.
+ *
+ * The division of labour: the CLI brings the workspace tools it is good at, and
+ * Legion brings the ones that are about the *room* — the shared plan, and who
+ * is sitting in it. Claude Code has no equivalent for either, and a seat that
+ * cannot bring in help has to fake it: the failure that prompted this was grok
+ * announcing "@claude — you're in" while seating nobody.
+ *
+ * Pre-approved at the SDK layer because `runTool` gates them on the way
+ * through; prompting here as well would ask the human the same question twice.
+ */
+const LEGION_MCP_TOOLS = [
+  "mcp__legion__publish_plan",
+  "mcp__legion__list_ranks",
+  "mcp__legion__add_seat",
+];
 
 /**
  * An in-process MCP server giving the Claude seat the room's shared plan.
@@ -491,6 +507,26 @@ async function legionSeatServer(ctx: ToolContext) {
     name: "legion",
     version: "1.0.0",
     tools: [
+      tool(
+        "list_ranks",
+        "List the agents that could be brought into this chat: which model each is, whether it has a " +
+          "working credential, and whether it is already seated.",
+        {},
+        async () => ({ content: [{ type: "text", text: await runTool("list_ranks", {}, ctx) }] }),
+      ),
+      tool(
+        "add_seat",
+        "Bring another agent into this chat so it can answer for itself. Use it when the work needs a " +
+          "capability nobody seated has. The human is asked first.",
+        {
+          modelId: z.string().describe("Which rank, from list_ranks, e.g. gemini or codex"),
+          role: z.string().describe("One line on why they are here and what they own"),
+          handle: z.string().optional().describe("Short @handle for them in this chat"),
+        },
+        async (args) => ({
+          content: [{ type: "text", text: await runTool("add_seat", { ...args }, ctx) }],
+        }),
+      ),
       tool(
         "publish_plan",
         "Publish or update your plan for this chat. Everyone in the room sees it, " +
@@ -632,6 +668,18 @@ export async function completeWithGrokCli(
   if (!bin) throw new Error("The grok CLI is not installed on this machine.");
 
   const { system, prompt } = renderPrompt(messages);
+
+  // With a human to ask, the seat also gets Legion's own write tools, served by
+  // the `legion` MCP server. They run inside this process, where the approval
+  // registry lives, so grok's permission model never decides whether a write
+  // happens — ours does. The token travels in the environment because grok
+  // spawns the MCP server itself and passes its own environment down.
+  let token = "";
+  if (ctx) {
+    const { mintSeatGrant } = await import("./seat-grant.server");
+    token = mintSeatGrant(ctx);
+  }
+
   const args = [
     "-p",
     prompt,
@@ -651,7 +699,16 @@ export async function completeWithGrokCli(
     "--max-turns",
     String(MAX_TOOL_CALLS),
   ];
-  if (system) args.push("--rules", system);
+  if (system) {
+    // Without this the seat burns two turns discovering the obvious: it reaches
+    // for `write`, is refused by the allowlist, tries the shell, is refused by
+    // the deny rules, and only then finds the tools it was always meant to use.
+    const rules = token
+      ? `${system}\n\nYour own file-writing and shell tools are switched off in this chat. ` +
+        "To change anything, use the legion tools (write_file, run_command) — they ask the human first."
+      : system;
+    args.push("--rules", rules);
+  }
   if (model) args.push("--model", model);
 
   logEvent({
@@ -662,7 +719,21 @@ export async function completeWithGrokCli(
     data: { model: model || "(cli default)" },
   });
   const started = Date.now();
-  const child = spawn(bin, args, { stdio: ["ignore", "pipe", "pipe"] });
+  const child = spawn(bin, args, {
+    stdio: ["ignore", "pipe", "pipe"],
+    env: {
+      ...process.env,
+      // Read by scripts/legion-mcp-bridge.mjs, which grok starts as its own
+      // subprocess. No token means the bridge offers no tools at all, so a
+      // human's own grok session sees an inert server rather than one whose
+      // every call fails.
+      LEGION_URL: legionUrl(),
+      LEGION_SEAT_TOKEN: token,
+      // A grok home Legion owns. Without it the seat inherits the workstation's
+      // skills, plugins, hooks and every MCP server in ~/.claude.json.
+      GROK_HOME: grokHome(),
+    },
+  });
 
   let stdout = "";
   let stderr = "";
@@ -691,7 +762,19 @@ export async function completeWithGrokCli(
     throw new Error(`grok exited ${code}${stderr ? `: ${stderr.slice(-200)}` : ""}`);
   }
 
-  return parseGrokStream(stdout, ctx);
+  try {
+    return await parseGrokStream(stdout, ctx);
+  } finally {
+    if (token) {
+      const { revokeSeatGrant } = await import("./seat-grant.server");
+      revokeSeatGrant(token);
+    }
+  }
+}
+
+/** Where a CLI subprocess should call this server back. */
+function legionUrl(): string {
+  return process.env.LEGION_URL ?? `http://localhost:${process.env.PORT ?? 3000}`;
 }
 
 /**
@@ -883,11 +966,30 @@ export async function completeWithCodexCli(
   if (!bin) throw new Error("The codex CLI is not installed on this machine.");
 
   const { system, prompt } = renderPrompt(messages);
-  // `mcp_servers={}` mirrors `tools: []` on the Claude side: a chat seat has no
-  // use for the workstation's MCP servers, and starting them adds seconds to
-  // every turn.
-  const child: ChildProcessWithoutNullStreams = spawn(bin, ["app-server", "-c", "mcp_servers={}"], {
+
+  // The workstation's own MCP servers stay out: a chat seat has no use for them
+  // and starting them adds seconds to every turn. Legion's one server does go
+  // in, scoped to the room — Codex already edits and runs commands under its
+  // own approvals, so it needs the shared plan and the seating tools, not a
+  // second `write_file`.
+  let token = "";
+  if (ctx) {
+    const { mintSeatGrant } = await import("./seat-grant.server");
+    token = mintSeatGrant(ctx, "room");
+  }
+  const mcpConfig = token
+    ? `mcp_servers={legion={command=${JSON.stringify(process.execPath)},args=[${JSON.stringify(
+        join(process.cwd(), "scripts", "legion-mcp-bridge.mjs"),
+      )}],env={LEGION_URL=${JSON.stringify(legionUrl())},LEGION_SEAT_TOKEN=${JSON.stringify(token)}}}}`
+    : "mcp_servers={}";
+
+  const child: ChildProcessWithoutNullStreams = spawn(bin, ["app-server", "-c", mcpConfig], {
     stdio: ["pipe", "pipe", "pipe"],
+    // A codex home Legion owns, so the seat does not inherit the workstation's
+    // MCP servers. `-c` merges rather than replaces: with the user's config in
+    // scope, `mcp_servers={legion=…}` left blender, infinitty and the rest
+    // attached, and the seat reached for one of those instead of ours.
+    env: { ...process.env, CODEX_HOME: codexHome() },
   });
 
   let nextId = 0;
@@ -945,6 +1047,21 @@ export async function completeWithCodexCli(
             void codexApprovalDecision(ctx, msg.method, msg.params, codexItems)
               .then((decision) => send({ jsonrpc: "2.0", id, result: { decision } }))
               .catch(() => send({ jsonrpc: "2.0", id, result: { decision: "decline" } }));
+            continue;
+          }
+          // Codex asks before letting an MCP server run a tool, as a form
+          // elicitation rather than one of its approval methods. Ours is the
+          // only server here and its tools stop for a human inside `runTool`,
+          // so answering yes is not waving anything through — declining, or
+          // leaving it unanswered as this once did, just meant the seat could
+          // never use the tools we lent it.
+          if (msg.method === "mcpServer/elicitation/request") {
+            const server = (msg.params as { serverName?: string })?.serverName;
+            send({
+              jsonrpc: "2.0",
+              id,
+              result: server === "legion" ? { action: "accept", content: {} } : { action: "decline" },
+            });
             continue;
           }
           send({ jsonrpc: "2.0", id, error: { code: -32601, message: "no interactive client" } });
