@@ -9,14 +9,21 @@ import { ApprovalPanel } from "@/components/chat/approval-panel";
 import { ActivityPanel } from "@/components/chat/activity-panel";
 import { TodoPanel } from "@/components/chat/todo-panel";
 import { QuestionForm } from "@/components/chat/question-form";
-import { listPendingQuestions, submitQuestionAnswers } from "@/lib/chat/question-actions";
+import { submitQuestionAnswers } from "@/lib/chat/question-actions";
 import type { PendingQuestion } from "@/lib/chat/questions.server";
-import { answerApproval, listPendingApprovals } from "@/lib/chat/approval-actions";
+import { answerApproval } from "@/lib/chat/approval-actions";
+import { usePulse } from "@/lib/chat/use-pulse";
 import type { ApprovalScope, PendingApprovalView } from "@/lib/chat/approvals.server";
 import { MessageItem } from "@/components/chat/message-item";
 import { SeatRail } from "@/components/chat/seat-rail";
 import { SeatAvatar } from "@/components/seat-avatar";
-import { addSeat, generateSeatReply, getConversation, postUserMessage, removeSeat } from "@/lib/chat/actions";
+import { streamReply } from "@/lib/chat/stream-reply";
+import {
+  addSeat,
+  getConversation,
+  postUserMessage,
+  removeSeat,
+} from "@/lib/chat/actions";
 import { listProviderStatuses } from "@/lib/chat/keys-actions";
 import type { ChatMessage, Conversation, NewSeatInput, Seat } from "@/lib/chat/types";
 import { MODEL_BY_ID, providerForModel, type ModelId } from "@/lib/models";
@@ -53,6 +60,19 @@ export function ChatView({
   const [approvals, setApprovals] = useState<PendingApprovalView[]>([]);
   // The message being replied to, so the next send is addressed at its author.
   const [replyTo, setReplyTo] = useState<{ handle: string; excerpt: string } | null>(null);
+  // Failed turns, by the id of the error row they left behind: enough to run
+  // exactly the same turn again without asking the human to retype it.
+  const [retryable, setRetryable] = useState<
+    Record<string, { handle: string; options: { task?: string | null; jumpIn?: boolean } }>
+  >({});
+  // The turn currently in flight, so the human can stop it. Held in a ref
+  // rather than state: aborting must not wait for a re-render.
+  const abortRef = useRef<AbortController | null>(null);
+  // The message being streamed into, so a stop can mark it as cut short. The
+  // server persists the same marker, but the client closed the stream and so
+  // never receives that final message event.
+  const livePlaceholderRef = useRef<string | null>(null);
+  const [stopping, setStopping] = useState(false);
   // Questions a seat has parked on. Polled with the approvals, same reasoning.
   const [questions, setQuestions] = useState<PendingQuestion[]>([]);
   const [workingHandle, setWorkingHandle] = useState<string | null>(null);
@@ -113,36 +133,27 @@ export function ChatView({
       return;
     }
     const started = Date.now();
-    const timer = window.setInterval(() => setElapsed(Math.floor((Date.now() - started) / 1000)), 250);
+    const timer = window.setInterval(
+      () => setElapsed(Math.floor((Date.now() - started) / 1000)),
+      250,
+    );
     return () => window.clearInterval(timer);
   }, [workingHandle]);
 
+  // Approvals and questions arrive on the chamber's shared poll. They are only
+  // read while a turn is running: nothing can be waiting on an answer otherwise,
+  // and a chamber sitting open should not keep asking.
+  const pulse = usePulse(conversationId, sending);
   useEffect(() => {
     if (!sending) {
       setApprovals([]);
       setQuestions([]);
       return;
     }
-    let stopped = false;
-    const poll = () => {
-      void listPendingApprovals({ data: conversationId })
-        .then((rows) => {
-          if (!stopped) setApprovals(rows);
-        })
-        .catch(() => undefined);
-      void listPendingQuestions({ data: conversationId })
-        .then((rows) => {
-          if (!stopped) setQuestions(rows);
-        })
-        .catch(() => undefined);
-    };
-    poll();
-    const timer = window.setInterval(poll, 1200);
-    return () => {
-      stopped = true;
-      window.clearInterval(timer);
-    };
-  }, [sending, conversationId]);
+    if (!pulse) return;
+    setApprovals(pulse.approvals);
+    setQuestions(pulse.questions);
+  }, [sending, pulse]);
 
   const decideApprovalRequest = async (id: string, scope: ApprovalScope) => {
     setApprovals((rows) => rows.filter((r) => r.id !== id));
@@ -165,7 +176,125 @@ export function ChatView({
   const readyByProvider = new Map(providers.map((p) => [p.id, p.configured]));
   const missingSeats = seats.filter((s) => !readyByProvider.get(providerForModel(s.modelId)));
 
-  async function send(content: string, askAll: boolean, extras?: { targetHandles?: string[]; task?: string }) {
+  /**
+   * Run one seat's turn over the streaming endpoint.
+   *
+   * Text lands in a placeholder message that grows as deltas arrive, so the
+   * thread shows the answer being written instead of a spinner. The server
+   * persists the finished message and sends it back; the placeholder is
+   * swapped for the real row so ids and timestamps match a reload.
+   */
+  async function runSeatTurn(
+    handle: string,
+    options: { task?: string | null; jumpIn?: boolean },
+  ): Promise<{ message: ChatMessage | null; followUpHandles: string[] }> {
+    const placeholderId = `live-${handle}-${Date.now()}`;
+    let text = "";
+    let created = false;
+    let outcome: { message: ChatMessage | null; followUpHandles: string[] } = {
+      message: null,
+      followUpHandles: [],
+    };
+
+    const controller = new AbortController();
+    abortRef.current = controller;
+    livePlaceholderRef.current = placeholderId;
+
+    await streamReply({ conversationId, handle, ...options }, (event) => {
+      if (event.type === "status") {
+        setStatus(`@${handle} · ${event.text}`);
+        return;
+      }
+      if (event.type === "delta") {
+        text += event.text;
+        setMessages((prev) => {
+          if (!created) {
+            created = true;
+            return [
+              ...prev,
+              {
+                id: placeholderId,
+                conversationId,
+                authorType: "agent",
+                agentId: seats.find((s) => s.handle === handle)?.id ?? null,
+                content: text,
+                mentions: [],
+                task: options.jumpIn ? "jump-in" : (options.task ?? null),
+                createdAt: new Date().toISOString(),
+              },
+            ];
+          }
+          return prev.map((m) => (m.id === placeholderId ? { ...m, content: text } : m));
+        });
+        return;
+      }
+      if (event.type === "message") {
+        outcome = { message: event.message, followUpHandles: event.followUpHandles };
+        setMessages((prev) =>
+          created
+            ? prev.map((m) => (m.id === placeholderId ? event.message : m))
+            : [...prev, event.message],
+        );
+        return;
+      }
+      if (event.type === "error") {
+        const errorId = `err-${handle}-${Date.now()}`;
+        // A failed turn used to be a dead end: what was asked lived only in the
+        // request that failed, so the human had to retype it. Keep the
+        // arguments beside the row instead.
+        setRetryable((prev) => ({ ...prev, [errorId]: { handle, options } }));
+        setMessages((prev) => [
+          ...prev.filter((m) => m.id !== placeholderId),
+          {
+            id: errorId,
+            conversationId,
+            authorType: "system",
+            agentId: null,
+            content: `@${handle} — ${event.error}`,
+            mentions: [handle],
+            task: "error",
+            createdAt: new Date().toISOString(),
+          },
+        ]);
+      }
+    }, controller.signal).catch((err) => {
+      // An abort is the human pressing stop, not a failure worth reporting.
+      if (!(err instanceof DOMException && err.name === "AbortError")) throw err;
+    });
+
+    abortRef.current = null;
+    livePlaceholderRef.current = null;
+    return outcome;
+  }
+
+  /**
+   * Stop the turn in flight.
+   *
+   * Aborting the fetch closes the stream, which the server treats as a cancel
+   * and passes on to the provider — so this stops generation rather than just
+   * looking away from it. Whatever streamed so far is kept and marked.
+   */
+  function stopTurn() {
+    setStopping(true);
+    const placeholderId = livePlaceholderRef.current;
+    abortRef.current?.abort();
+    abortRef.current = null;
+    if (placeholderId) {
+      setMessages((prev) =>
+        prev.map((m) =>
+          m.id === placeholderId && !m.content.endsWith("_(stopped)_")
+            ? { ...m, content: `${m.content}\n\n_(stopped)_` }
+            : m,
+        ),
+      );
+    }
+  }
+
+  async function send(
+    content: string,
+    askAll: boolean,
+    extras?: { targetHandles?: string[]; task?: string },
+  ) {
     if (sending) return;
     const first =
       extras?.targetHandles?.[0] ??
@@ -238,39 +367,8 @@ export function ChatView({
         if (spoken.has(handle)) continue;
         setWorkingHandle(handle);
         setStatus(`@${handle} is thinking`);
-        const reply = await generateSeatReply({
-          data: { conversationId, handle, task: extras?.task ?? null },
-        });
-        if (reply.missing) {
-          const note: ChatMessage = {
-            id: `need-${handle}-${Date.now()}`,
-            conversationId,
-            authorType: "system",
-            agentId: null,
-            content: `@${handle} needs ${reply.missing.name} connected in Settings before it can speak.`,
-            mentions: [handle],
-            task: "missing-key",
-            createdAt: new Date().toISOString(),
-          };
-          setMessages((prev) => [...prev, note]);
-          continue;
-        }
-        if (reply.error && !reply.message) {
-          const note: ChatMessage = {
-            id: `err-${handle}-${Date.now()}`,
-            conversationId,
-            authorType: "system",
-            agentId: null,
-            content: `@${handle} — ${reply.error}`,
-            mentions: [handle],
-            task: "error",
-            createdAt: new Date().toISOString(),
-          };
-          setMessages((prev) => [...prev, note]);
-          continue;
-        }
+        const reply = await runSeatTurn(handle, { task: extras?.task ?? null });
         if (reply.message) {
-          setMessages((prev) => [...prev, reply.message!]);
           spoken.add(handle);
           hops += 1;
           for (const next of reply.followUpHandles) {
@@ -289,10 +387,7 @@ export function ChatView({
         if (spoken.has(handle)) continue;
         setWorkingHandle(handle);
         setStatus(`@${handle} may jump in`);
-        const reply = await generateSeatReply({
-          data: { conversationId, handle, jumpIn: true },
-        });
-        if (reply.message) setMessages((prev) => [...prev, reply.message!]);
+        await runSeatTurn(handle, { jumpIn: true });
       }
     } catch (err) {
       toast.error(err instanceof Error ? err.message : "Send failed");
@@ -301,6 +396,9 @@ export function ChatView({
       setSending(false);
       setWorkingHandle(null);
       setStatus(null);
+      // Without this the hint reads "stopping" for the rest of the session.
+      setStopping(false);
+      abortRef.current = null;
     }
   }
 
@@ -308,9 +406,13 @@ export function ChatView({
     const seat = await addSeat({ data: { conversationId, ...input } });
     setSeats((prev) => [...prev, seat]);
     if (after === "introduce") {
-      await send(`@${seat.handle} Introduce yourself in one short paragraph. Say how you'll help in this room.`, false, {
-        targetHandles: [seat.handle],
-      });
+      await send(
+        `@${seat.handle} Introduce yourself in one short paragraph. Say how you'll help in this room.`,
+        false,
+        {
+          targetHandles: [seat.handle],
+        },
+      );
     } else if (after === "review") {
       await send(
         `@${seat.handle} Review the latest reply in this chat. Be specific about correctness, gaps, and what to change.`,
@@ -339,7 +441,9 @@ export function ChatView({
             )}
           </div>
           <p className="truncate pl-8 text-xs text-fg-subtle">
-            {seats.length === 0 ? "No ranks seated yet" : seats.map((s) => `@${s.handle}`).join(" · ")}
+            {seats.length === 0
+              ? "No ranks seated yet"
+              : seats.map((s) => `@${s.handle}`).join(" · ")}
           </p>
         </div>
         <SeatRail
@@ -351,7 +455,9 @@ export function ChatView({
               setSeats((prev) => prev.filter((s) => s.id !== seat.id));
             });
           }}
-          onAsk={(handle, task, prompt) => void send(prompt, false, { targetHandles: [handle], task })}
+          onAsk={(handle, task, prompt) =>
+            void send(prompt, false, { targetHandles: [handle], task })
+          }
         />
       </header>
 
@@ -399,10 +505,30 @@ export function ChatView({
               </div>
             ) : (
               <MessageItem
+                onRetry={
+                  retryable[message.id]
+                    ? () => {
+                        const spec = retryable[message.id];
+                        // Drop the error row and its record first: a retry that
+                        // fails again writes a fresh row, and two "try again"
+                        // buttons for one question is a worse answer than none.
+                        setMessages((prev) => prev.filter((row) => row.id !== message.id));
+                        setRetryable((prev) => {
+                          const next = { ...prev };
+                          delete next[message.id];
+                          return next;
+                        });
+                        void runSeatTurn(spec.handle, spec.options);
+                      }
+                    : undefined
+                }
                 onReply={(m, seat) =>
                   setReplyTo(
                     seat
-                      ? { handle: seat.handle, excerpt: m.content.replace(/\s+/g, " ").slice(0, 80) }
+                      ? {
+                          handle: seat.handle,
+                          excerpt: m.content.replace(/\s+/g, " ").slice(0, 80),
+                        }
                       : null,
                   )
                 }
@@ -410,7 +536,9 @@ export function ChatView({
                 message={message}
                 seat={message.agentId ? seatById.get(message.agentId) : undefined}
                 seats={seats}
-                onAsk={(handle, task, prompt) => void send(prompt, false, { targetHandles: [handle], task })}
+                onAsk={(handle, task, prompt) =>
+                  void send(prompt, false, { targetHandles: [handle], task })
+                }
               />
             ),
           )
@@ -427,8 +555,14 @@ export function ChatView({
             <div className="flex items-center gap-2 text-sm text-fg-subtle">
               <span className="inline-flex items-center gap-1">
                 <span className="lumen-dot size-1.5 rounded-full bg-accent" />
-                <span className="lumen-dot size-1.5 rounded-full bg-accent" style={{ animationDelay: "0.15s" }} />
-                <span className="lumen-dot size-1.5 rounded-full bg-accent" style={{ animationDelay: "0.3s" }} />
+                <span
+                  className="lumen-dot size-1.5 rounded-full bg-accent"
+                  style={{ animationDelay: "0.15s" }}
+                />
+                <span
+                  className="lumen-dot size-1.5 rounded-full bg-accent"
+                  style={{ animationDelay: "0.3s" }}
+                />
               </span>
               <span>{status ?? "thinking"}</span>
               <span className="tabular-nums text-fg-subtle">{elapsed}s</span>
@@ -439,59 +573,68 @@ export function ChatView({
 
       <div className="px-3 pt-1 pb-[max(1rem,env(safe-area-inset-bottom))] md:px-6">
         <div className="mx-auto max-w-2xl">
-          <TodoPanel conversationId={conversationId} live={sending} />
-          <ActivityPanel conversationId={conversationId} live={sending} />
-          {questions[0] && (
-            <QuestionForm
-              request={questions[0]}
-              onSubmit={async (answers) => {
-                setQuestions((q) => q.slice(1));
-                await submitQuestionAnswers({ data: { id: questions[0].id, answers } });
-              }}
-              onDismiss={async () => {
-                setQuestions((q) => q.slice(1));
-                await submitQuestionAnswers({ data: { id: questions[0].id, answers: null } });
-              }}
-            />
-          )}
-          {approvals[0] && (
-            <ApprovalPanel request={approvals[0]} onDecide={decideApprovalRequest} />
-          )}
-          <QueueTray
-            queue={queue}
-            draining={sending}
-            onEdit={(id, text) => setQueue((q) => q.map((row) => (row.id === id ? { ...row, text } : row)))}
-            onSendNow={(id) => setQueue((q) => [...q.filter((r) => r.id === id), ...q.filter((r) => r.id !== id)])}
-            onRemove={(id) => setQueue((q) => q.filter((row) => row.id !== id))}
-            onClear={() => setQueue([])}
-          />
-          <Composer
-            seats={seats}
-            // Only a room with no seats blocks typing. While a seat is working,
-            // the composer stays live and Enter queues instead — see `submit`.
-            disabled={seats.length === 0}
-            queueing={sending}
-            replyTo={replyTo}
-            onClearReply={() => setReplyTo(null)}
-            placeholder={
-              seats.length === 0
-                ? "Seat a rank before we write"
-                : seats.length > 1
-                  ? `The league · @${seats[0]?.handle ?? "name"} to call a rank`
-                  : "Write to us. Enter to send"
-            }
-            onSend={(text, askAll) => {
-              if (sending) {
-                setQueue((q) => [...q, { id: newQueueId(), text, askAll }]);
-                return;
+          {/* One surface: panels above read as a drawer opening out of the
+              input rather than as separate cards stacked on it. */}
+          <div className="composer-dock">
+            <TodoPanel conversationId={conversationId} live={sending} />
+            <ActivityPanel conversationId={conversationId} live={sending} />
+            {questions[0] && (
+              <QuestionForm
+                request={questions[0]}
+                onSubmit={async (answers) => {
+                  setQuestions((q) => q.slice(1));
+                  await submitQuestionAnswers({ data: { id: questions[0].id, answers } });
+                }}
+                onDismiss={async () => {
+                  setQuestions((q) => q.slice(1));
+                  await submitQuestionAnswers({ data: { id: questions[0].id, answers: null } });
+                }}
+              />
+            )}
+            {approvals[0] && (
+              <ApprovalPanel request={approvals[0]} onDecide={decideApprovalRequest} />
+            )}
+            <QueueTray
+              queue={queue}
+              draining={sending}
+              onEdit={(id, text) =>
+                setQueue((q) => q.map((row) => (row.id === id ? { ...row, text } : row)))
               }
-              void send(text, askAll);
-            }}
-            onAddSeat={() => setAddOpen(true)}
-          />
+              onSendNow={(id) =>
+                setQueue((q) => [...q.filter((r) => r.id === id), ...q.filter((r) => r.id !== id)])
+              }
+              onRemove={(id) => setQueue((q) => q.filter((row) => row.id !== id))}
+              onClear={() => setQueue([])}
+            />
+            <Composer
+              seats={seats}
+              // Only a room with no seats blocks typing. While a seat is working,
+              // the composer stays live and Enter queues instead — see `submit`.
+              disabled={seats.length === 0}
+              queueing={sending}
+              replyTo={replyTo}
+              onClearReply={() => setReplyTo(null)}
+              onStop={stopTurn}
+              placeholder={
+                seats.length === 0
+                  ? "Seat a rank before we write"
+                  : seats.length > 1
+                    ? `The league · @${seats[0]?.handle ?? "name"} to call a rank`
+                    : "Write to us. Enter to send"
+              }
+              onSend={(text, askAll) => {
+                if (sending) {
+                  setQueue((q) => [...q, { id: newQueueId(), text, askAll }]);
+                  return;
+                }
+                void send(text, askAll);
+              }}
+              onAddSeat={() => setAddOpen(true)}
+            />
+          </div>
           <p className="mt-2 px-1 text-[11px] text-fg-subtle">
             {sending
-              ? `${status ?? "working"} · Enter adds to the queue`
+              ? `${stopping ? "stopping" : (status ?? "working")} · Enter adds to the queue · ⏹ stops`
               : "Enter to send · Shift+Enter for a new line"}
           </p>
         </div>

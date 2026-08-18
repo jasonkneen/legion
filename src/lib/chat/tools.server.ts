@@ -509,7 +509,8 @@ export async function runTool(
     if (!outcome.allowed) {
       return outcome.scope === "timeout"
         ? `${name} was not approved in time. Refused — ask again if it is still needed.`
-        : `${name} was declined by the human. Do not retry it; continue without it.`;
+        : `${name} was declined by the human. Do not retry it, and do not achieve the same thing another way. ` +
+          "Say what you would have done and carry on.";
     }
   }
 

@@ -13,6 +13,7 @@ import { Route as IndexRouteImport } from './routes/index'
 import { Route as DiscoverRouteImport } from './routes/discover'
 import { Route as LoginRouteImport } from './routes/login'
 import { Route as SettingsRouteImport } from './routes/settings'
+import { Route as ApiReplyRouteImport } from './routes/api/reply'
 import { Route as CIdRouteImport } from './routes/c.$id'
 import { Route as ApiAuthSplatRouteImport } from './routes/api/auth/$'
 
@@ -36,6 +37,11 @@ const SettingsRoute = SettingsRouteImport.update({
   path: '/settings',
   getParentRoute: () => rootRouteImport,
 } as any)
+const ApiReplyRoute = ApiReplyRouteImport.update({
+  id: '/api/reply',
+  path: '/api/reply',
+  getParentRoute: () => rootRouteImport,
+} as any)
 const CIdRoute = CIdRouteImport.update({
   id: '/c/$id',
   path: '/c/$id',
@@ -52,6 +58,7 @@ export interface FileRoutesByFullPath {
   '/discover': typeof DiscoverRoute
   '/login': typeof LoginRoute
   '/settings': typeof SettingsRoute
+  '/api/reply': typeof ApiReplyRoute
   '/c/$id': typeof CIdRoute
   '/api/auth/$': typeof ApiAuthSplatRoute
 }
@@ -60,6 +67,7 @@ export interface FileRoutesByTo {
   '/discover': typeof DiscoverRoute
   '/login': typeof LoginRoute
   '/settings': typeof SettingsRoute
+  '/api/reply': typeof ApiReplyRoute
   '/c/$id': typeof CIdRoute
   '/api/auth/$': typeof ApiAuthSplatRoute
 }
@@ -69,21 +77,36 @@ export interface FileRoutesById {
   '/discover': typeof DiscoverRoute
   '/login': typeof LoginRoute
   '/settings': typeof SettingsRoute
+  '/api/reply': typeof ApiReplyRoute
   '/c/$id': typeof CIdRoute
   '/api/auth/$': typeof ApiAuthSplatRoute
 }
 export interface FileRouteTypes {
   fileRoutesByFullPath: FileRoutesByFullPath
   fullPaths:
-    '/' | '/discover' | '/login' | '/settings' | '/c/$id' | '/api/auth/$'
+    | '/'
+    | '/discover'
+    | '/login'
+    | '/settings'
+    | '/api/reply'
+    | '/c/$id'
+    | '/api/auth/$'
   fileRoutesByTo: FileRoutesByTo
-  to: '/' | '/discover' | '/login' | '/settings' | '/c/$id' | '/api/auth/$'
+  to:
+    | '/'
+    | '/discover'
+    | '/login'
+    | '/settings'
+    | '/api/reply'
+    | '/c/$id'
+    | '/api/auth/$'
   id:
     | '__root__'
     | '/'
     | '/discover'
     | '/login'
     | '/settings'
+    | '/api/reply'
     | '/c/$id'
     | '/api/auth/$'
   fileRoutesById: FileRoutesById
@@ -93,6 +116,7 @@ export interface RootRouteChildren {
   DiscoverRoute: typeof DiscoverRoute
   LoginRoute: typeof LoginRoute
   SettingsRoute: typeof SettingsRoute
+  ApiReplyRoute: typeof ApiReplyRoute
   CIdRoute: typeof CIdRoute
   ApiAuthSplatRoute: typeof ApiAuthSplatRoute
 }
@@ -127,6 +151,13 @@ declare module '@tanstack/react-router' {
       preLoaderRoute: typeof SettingsRouteImport
       parentRoute: typeof rootRouteImport
     }
+    '/api/reply': {
+      id: '/api/reply'
+      path: '/api/reply'
+      fullPath: '/api/reply'
+      preLoaderRoute: typeof ApiReplyRouteImport
+      parentRoute: typeof rootRouteImport
+    }
     '/c/$id': {
       id: '/c/$id'
       path: '/c/$id'
@@ -149,6 +180,7 @@ const rootRouteChildren: RootRouteChildren = {
   DiscoverRoute: DiscoverRoute,
   LoginRoute: LoginRoute,
   SettingsRoute: SettingsRoute,
+  ApiReplyRoute: ApiReplyRoute,
   CIdRoute: CIdRoute,
   ApiAuthSplatRoute: ApiAuthSplatRoute,
 }

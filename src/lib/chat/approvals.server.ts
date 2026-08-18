@@ -49,16 +49,72 @@ export type PendingApprovalView = {
   reason: string;
   /** The command line or path, already stringified for display. */
   detail: string;
+  /** True when "always" will remember this exact command, not the whole tool. */
+  perCommand: boolean;
   createdAt: number;
 };
 
+/**
+ * Argument names that say *what* a tool is about to act on, most specific first.
+ *
+ * Each agent names them differently — our own tools use `path`, Claude Code's
+ * Write and Edit use `file_path`, shells use `command`. Missing one is not
+ * cosmetic: a browser run of the approval flow showed "@claude wants to run
+ * Write" with no path underneath, which is a prompt no one can answer safely.
+ */
+const DETAIL_KEYS = [
+  "command",
+  "path",
+  "file_path",
+  "filePath",
+  "notebook_path",
+  "url",
+  "pattern",
+  "query",
+];
+
+/**
+ * Tools whose whole purpose is to run whatever they are handed.
+ *
+ * These get remembered per command rather than per tool. "Always allow Bash"
+ * would otherwise be the widest grant in the app — every command, in every
+ * chamber, for good — from a button pressed to approve one `npm test`.
+ */
+const COMMAND_TOOLS = new Set(["Bash", "run_command", "codex:run_command", "run_terminal_command"]);
+
+/**
+ * What a grant is remembered against.
+ *
+ * For most tools that is the tool name: approving `Write` once and for all is a
+ * coherent thing to want. For a shell it is the tool *and the exact command*, so
+ * a remembered `npm test` cannot quietly authorise `rm -rf`.
+ */
+export function permissionKey(tool: string, args: Record<string, unknown>): string {
+  if (!COMMAND_TOOLS.has(tool)) return tool;
+  const command = typeof args.command === "string" ? args.command.trim() : "";
+  return command ? `${tool}(${command})` : tool;
+}
+
+/** True when a decision on this tool will be remembered per command. */
+export function isCommandTool(tool: string): boolean {
+  return COMMAND_TOOLS.has(tool);
+}
+
 export function toApprovalView(p: PendingApproval): PendingApprovalView {
-  const detail =
-    typeof p.args.command === "string"
-      ? p.args.command
-      : typeof p.args.path === "string"
-        ? p.args.path
-        : "";
+  let detail = "";
+  for (const key of DETAIL_KEYS) {
+    const value = p.args[key];
+    if (typeof value === "string" && value.trim()) {
+      detail = value;
+      break;
+    }
+  }
+  // For a write, how much is being written matters as much as where.
+  const content = p.args.content ?? p.args.new_string;
+  if (detail && typeof content === "string") {
+    const lines = content.split("\n").length;
+    detail += `  (${content.length} chars, ${lines} line${lines === 1 ? "" : "s"})`;
+  }
   return {
     id: p.id,
     conversationId: p.conversationId,
@@ -66,6 +122,7 @@ export function toApprovalView(p: PendingApproval): PendingApprovalView {
     tool: p.tool,
     reason: p.reason,
     detail,
+    perCommand: isCommandTool(p.tool),
     createdAt: p.createdAt,
   };
 }
@@ -162,9 +219,31 @@ function hasSessionGrant(conversationId: string, tool: string): boolean {
   return state().session.get(conversationId)?.has(tool) ?? false;
 }
 
-/** Forget a conversation's session grants (called when a chat is deleted). */
+/** Forget a conversation's session grants. */
 export function clearSessionGrants(conversationId: string): void {
   state().session.delete(conversationId);
+}
+
+/**
+ * Release everything a deleted chamber was holding.
+ *
+ * A turn parked on an approval waits five minutes for an answer. If the human
+ * deletes the chat while a seat is asking, that prompt is unanswerable — the
+ * screen it lives on is gone — so the turn sat there holding a CLI subprocess
+ * open until it timed out. Deleting the room refuses its outstanding questions
+ * instead, which the seats already know how to handle.
+ */
+export function abandonConversation(conversationId: string): number {
+  let released = 0;
+  for (const [id, waiter] of [...state().waiting.entries()]) {
+    if (waiter.pending.conversationId !== conversationId) continue;
+    state().waiting.delete(id);
+    clearTimeout(waiter.timer);
+    waiter.resolve("deny");
+    released += 1;
+  }
+  clearSessionGrants(conversationId);
+  return released;
 }
 
 /** Everything currently parked, for the UI to render. */
@@ -187,8 +266,9 @@ export async function decideApproval(
   state().waiting.delete(id);
   clearTimeout(waiter.timer);
 
-  if (scope === "session") grantSession(waiter.pending.conversationId, waiter.pending.tool);
-  if (scope === "always") await setStandingDecision(userId, waiter.pending.tool, "always");
+  const key = permissionKey(waiter.pending.tool, waiter.pending.args);
+  if (scope === "session") grantSession(waiter.pending.conversationId, key);
+  if (scope === "always") await setStandingDecision(userId, key, "always");
   if (scope === "deny") {
     // A one-off refusal, not a standing ban: banning a tool forever should be
     // an explicit choice in settings, not the fastest button in a dialog.
@@ -199,7 +279,7 @@ export async function decideApproval(
     kind: "tool:start",
     actor: waiter.pending.actor,
     conversationId: waiter.pending.conversationId,
-    message: `approval ${scope} for ${waiter.pending.tool}`,
+    message: `approval ${scope} for ${key}`,
   });
   waiter.resolve(scope);
   return true;
@@ -223,9 +303,11 @@ export type ApprovalOutcome = { allowed: boolean; scope: ApprovalScope | "auto" 
  */
 export async function requestApproval(req: ApprovalRequest): Promise<ApprovalOutcome> {
   const standing = await standingDecisions(req.userId).catch(() => ({}) as Record<string, "always" | "deny">);
-  if (standing[req.tool] === "deny") return { allowed: false, scope: "always" };
-  if (standing[req.tool] === "always") return { allowed: true, scope: "auto" };
-  if (hasSessionGrant(req.conversationId, req.tool)) return { allowed: true, scope: "auto" };
+  const key = permissionKey(req.tool, req.args);
+  // A ban on the tool outranks a grant on one of its commands.
+  if (standing[req.tool] === "deny" || standing[key] === "deny") return { allowed: false, scope: "always" };
+  if (standing[key] === "always") return { allowed: true, scope: "auto" };
+  if (hasSessionGrant(req.conversationId, key)) return { allowed: true, scope: "auto" };
 
   const id = `ap-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
   const pending: PendingApproval = {

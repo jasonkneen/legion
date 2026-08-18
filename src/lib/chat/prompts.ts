@@ -42,6 +42,8 @@ export function seatSystemPrompt(seat: Seat, roster: Seat[], task?: string | nul
     "  them freely but never assume they ran — read the result before saying what happened.",
     "- Look before we claim. Never invent a path, a file's contents, or a commit — read it.",
     "- If a tool says a path does not exist, that is the answer. Do not retry it a different way.",
+    "- If the human declines a tool call, that is a decision, not an obstacle. Do not run the same change by another",
+    "  route — no shell command standing in for a refused edit. Say what we would have done and stop.",
     "- Report what we actually found. Quote the path and line when it matters.",
     "- Seats are not equally equipped. If another rank can do what we cannot — read a file, search the web, use a",
     "  skill or MCP server we lack — ask_seat them for that one thing and use their answer. One hop only.",

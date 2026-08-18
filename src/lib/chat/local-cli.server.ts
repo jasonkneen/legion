@@ -142,7 +142,34 @@ const SIMPLE_CLIS: Partial<Record<LocalCliId, SimpleCliSpec>> = {
  * page fetch are in — they read the world without touching the workstation, and
  * they are the one capability the API seats cannot offer.
  */
-const GROK_READONLY_TOOLS = ["read_file", "list_dir", "grep", "web_search", "open_page", "open_page_with_find"];
+export const GROK_READONLY_TOOLS = [
+  "read_file",
+  "list_dir",
+  "grep",
+  "web_search",
+  "open_page",
+  "open_page_with_find",
+  // Planning only writes to the room's shared list, never to disk.
+  "todo_write",
+];
+
+/**
+ * Tools grok is refused outright, on top of the allowlist.
+ *
+ * The allowlist alone should be enough, but grok's permission mode is read from
+ * the workstation's own `~/.grok/config.toml`, and a common setting there is
+ * `permission_mode = "always-approve"`. Measured on this machine: with that set,
+ * an ACP seat wrote a file without ever sending `session/request_permission` —
+ * `--permission-mode`, a private `GROK_HOME`, a private leader socket and
+ * `_meta: { yoloMode: false }` all failed to make it ask. Deny rules are the one
+ * thing documented to outrank always-approve, and measured to: grok tried the
+ * write, then a shell fallback, and was blocked both times.
+ *
+ * So this seat is read-only by construction, not by good behaviour. Until grok
+ * can route a permission request back to us the way Claude Code and Codex do,
+ * widening `GROK_READONLY_TOOLS` would hand it unattended write access.
+ */
+export const GROK_DENY_RULES = ["Write", "Edit", "Bash", "write", "search_replace", "run_terminal_command"];
 
 type DetectCache = Partial<Record<LocalCliId, string | null>>;
 const globalRef = globalThis as typeof globalThis & { __legionLocalCli__?: DetectCache };
@@ -245,7 +272,19 @@ const CLAUDE_READONLY_TOOLS = ["Read", "Glob", "Grep"];
 const CLAUDE_WRITE_TOOLS = [
   "Edit",
   "Write",
+  // Bash is gated, with one measured caveat: Claude Code classifies harmless
+  // commands itself and runs them before `canUseTool` is reached. `echo hello`
+  // executed with no prompt; `touch file` asked. Both are logged, so an
+  // unprompted command is still visible in the activity panel.
   "Bash",
+  // TodoWrite is how some Claude Code builds plan. Whether it exists at all is
+  // version-dependent — this workstation's build offers TaskCreate/TaskUpdate
+  // instead, and silently drops an unknown name from `tools`, which is why the
+  // seat used to answer "I have no todo tool". It is still requested (harmless
+  // where absent, useful where present) and captured in `canUseTool`, but the
+  // reliable path is `mcp__legion__publish_plan` below, which we supply
+  // ourselves and so exists on every build.
+  "TodoWrite",
   // Task fans work out to subagents. It is in the gated set because a subagent
   // inherits the seat's reach: approving one Task can mean several tool calls
   // the human never saw individually. The activity panel shows each subagent
@@ -277,14 +316,24 @@ export async function completeWithClaudeCli(
         // Reads are pre-approved; anything that writes goes through canUseTool
         // below, which parks the turn on the same approval registry the API
         // seats use — so one prompt style covers every kind of agent.
-        allowedTools: CLAUDE_READONLY_TOOLS,
+        // Publishing a plan touches nothing on disk, so it is pre-approved
+        // rather than parked — asking a human to confirm a to-do list would be
+        // noise, and the plan is visible in the panel the moment it lands.
+        allowedTools: ctx ? [...CLAUDE_READONLY_TOOLS, LEGION_PLAN_TOOL] : CLAUDE_READONLY_TOOLS,
         ...(ctx ? { canUseTool: claudeApprovalBridge(ctx) } : {}),
         settingSources: [],
         // The user's MCP servers, handed to Claude Code directly rather than
         // proxied: it speaks MCP natively, and its own tool loop can use them
         // without a round trip through ours. `settingSources: []` means only
         // these are loaded, not the workstation's own MCP config.
-        ...(ctx ? { mcpServers: await claudeMcpServers(ctx.userId) } : {}),
+        ...(ctx
+          ? {
+              mcpServers: {
+                ...(await claudeMcpServers(ctx.userId)),
+                legion: await legionSeatServer(ctx),
+              },
+            }
+          : {}),
         cwd: toolsRoot(),
         maxTurns: MAX_TOOL_CALLS,
         abortController: abort,
@@ -292,6 +341,39 @@ export async function completeWithClaudeCli(
     });
 
     for await (const message of run) {
+      // Every tool the seat actually uses, whether or not it had to ask.
+      //
+      // `canUseTool` is not the whole story: Claude Code classifies harmless
+      // commands itself and runs them before the callback is consulted —
+      // measured, `echo hello` executed with no approval and left no trace
+      // anywhere in the app. Reads running unattended is the intended bargain,
+      // but "what did this session do on my machine" has to include them, so
+      // the activity panel is fed from the message stream rather than from the
+      // approval path.
+      if (message.type === "assistant" && ctx) {
+        for (const block of message.message?.content ?? []) {
+          if (typeof block === "object" && block && (block as { type?: string }).type === "tool_use") {
+            const use = block as { name?: string; input?: Record<string, unknown> };
+            const input = use.input ?? {};
+            const target =
+              typeof input.command === "string"
+                ? input.command
+                : typeof input.file_path === "string"
+                  ? input.file_path
+                  : typeof input.pattern === "string"
+                    ? input.pattern
+                    : "";
+            logEvent({
+              kind: "tool:start",
+              actor: ctx.actor,
+              conversationId: ctx.conversationId,
+              message: `${use.name ?? "tool"}${target ? `: ${target.slice(0, 160)}` : ""}`,
+              data: { preview: target.slice(0, 200) },
+            });
+          }
+        }
+      }
+
       // Subagents: Claude Code can fan work out to Task subagents, which would
       // otherwise be invisible — the seat just takes longer and comes back with
       // more. Log each one so the activity panel can show who it delegated to.
@@ -391,6 +473,54 @@ export async function completeWithSimpleCli(
  * every request bouncing through Legion. A malformed entry is skipped rather
  * than failing the turn.
  */
+/** The tool name Claude Code sees for our own plan tool. */
+const LEGION_PLAN_TOOL = "mcp__legion__publish_plan";
+
+/**
+ * An in-process MCP server giving the Claude seat the room's shared plan.
+ *
+ * Claude Code's own planning tool is not stable across builds — the preset on
+ * this workstation has no `TodoWrite` — so the seat cannot be relied on to have
+ * one. This supplies it, runs in this process (no subprocess, no transport),
+ * and writes straight to the same list grok and Codex publish to.
+ */
+async function legionSeatServer(ctx: ToolContext) {
+  const { createSdkMcpServer, tool } = await import("@anthropic-ai/claude-agent-sdk");
+  const { z } = await import("zod");
+  return createSdkMcpServer({
+    name: "legion",
+    version: "1.0.0",
+    tools: [
+      tool(
+        "publish_plan",
+        "Publish or update your plan for this chat. Everyone in the room sees it, " +
+          "so send the whole list each time — including steps already finished.",
+        {
+          steps: z
+            .array(
+              z.object({
+                text: z.string().describe("What the step is"),
+                status: z.enum(["pending", "in_progress", "completed"]).default("pending"),
+              }),
+            )
+            .describe("The full plan, in order"),
+        },
+        async ({ steps }) => {
+          const { writeTodos } = await import("./todos.server");
+          const written = writeTodos(ctx.conversationId, ctx.actor, steps);
+          logEvent({
+            kind: "tool:end",
+            actor: ctx.actor,
+            conversationId: ctx.conversationId,
+            message: `published a ${written.length}-step plan`,
+          });
+          return { content: [{ type: "text", text: `Plan published: ${written.length} step(s).` }] };
+        },
+      ),
+    ],
+  });
+}
+
 async function claudeMcpServers(
   userId: string,
 ): Promise<Record<string, import("@anthropic-ai/claude-agent-sdk").McpServerConfig>> {
@@ -433,6 +563,33 @@ function claudeApprovalBridge(ctx: ToolContext) {
     input: Record<string, unknown>,
     options: { title?: string; description?: string },
   ): Promise<{ behavior: "allow"; updatedInput: Record<string, unknown> } | { behavior: "deny"; message: string }> => {
+    // Planning is not a permission question. Capture the plan for the shared
+    // panel and let it through, so a Claude seat's todos show up beside every
+    // other seat's instead of staying inside the CLI.
+    if (toolName === "TodoWrite") {
+      const rows = Array.isArray((input as { todos?: unknown[] }).todos)
+        ? ((input as { todos: Record<string, unknown>[] }).todos ?? [])
+        : [];
+      if (rows.length) {
+        const { writeTodos } = await import("./todos.server");
+        writeTodos(
+          ctx.conversationId,
+          ctx.actor,
+          rows.map((row) => ({
+            text: String(row.content ?? row.text ?? row.activeForm ?? ""),
+            status: row.status,
+          })),
+        );
+        logEvent({
+          kind: "tool:end",
+          actor: ctx.actor,
+          conversationId: ctx.conversationId,
+          message: `published a ${rows.length}-step plan`,
+        });
+      }
+      return { behavior: "allow", updatedInput: input };
+    }
+
     const { requestApproval } = await import("./approvals.server");
     const outcome = await requestApproval({
       userId: ctx.userId,
@@ -450,7 +607,8 @@ function claudeApprovalBridge(ctx: ToolContext) {
           message:
             outcome.scope === "timeout"
               ? "No answer in time; treat this tool as unavailable and continue."
-              : "The human declined. Do not retry; continue without it.",
+              : "The human declined this. Do not retry it, and do not achieve the same thing another way — " +
+                "no shell command standing in for a refused edit. Say what you would have done and carry on.",
         };
   };
 }
@@ -477,14 +635,18 @@ export async function completeWithGrokCli(
   const args = [
     "-p",
     prompt,
+    // ACP session updates rather than a single JSON blob: this is the only
+    // format that reports the plan and the tool calls, and it lets the answer
+    // be assembled as it is written instead of after the process exits.
     "--output-format",
-    "json",
+    "streaming-json",
     "--cwd",
     toolsRoot(),
     "--tools",
     GROK_READONLY_TOOLS.join(","),
     "--permission-mode",
     "dontAsk",
+    ...GROK_DENY_RULES.flatMap((rule) => ["--deny", rule]),
     "--no-subagents",
     "--max-turns",
     String(MAX_TOOL_CALLS),
@@ -529,24 +691,63 @@ export async function completeWithGrokCli(
     throw new Error(`grok exited ${code}${stderr ? `: ${stderr.slice(-200)}` : ""}`);
   }
 
-  // Older/plain output is bare text; JSON mode is the documented shape.
-  try {
-    const parsed = JSON.parse(stdout) as { text?: string; stopReason?: string; error?: string };
-    if (parsed.error) throw new Error(parsed.error);
-    const text = parsed.text?.trim();
-    if (text) return text;
-    throw new Error(
-      parsed.stopReason === "cancelled"
-        ? "grok stopped before answering (hit its turn limit)."
-        : "grok returned an empty reply.",
-    );
-  } catch (err) {
-    if (err instanceof SyntaxError) {
-      const text = stdout.trim();
-      if (text) return text;
+  return parseGrokStream(stdout, ctx);
+}
+
+/**
+ * Fold grok's ACP session updates into an answer.
+ *
+ * `text` frames are the reply, arriving token by token. A `plan` frame is grok
+ * planning its own work — copied into the room's shared list so its todos sit
+ * beside every other seat's rather than staying inside the CLI. Anything else
+ * (thoughts, tool call bookkeeping) is deliberately not shown: it is the seat's
+ * working, not its answer.
+ */
+async function parseGrokStream(stdout: string, ctx?: ToolContext): Promise<string> {
+  let text = "";
+  let stopReason = "";
+  let failure = "";
+  let plan: Record<string, unknown>[] | null = null;
+
+  for (const line of stdout.split("\n")) {
+    if (!line.trim().startsWith("{")) continue;
+    let frame: { type?: string; data?: string; entries?: unknown[]; stopReason?: string; error?: string };
+    try {
+      frame = JSON.parse(line);
+    } catch {
+      continue;
     }
-    throw err;
+    if (frame.type === "text" && typeof frame.data === "string") text += frame.data;
+    else if (frame.type === "plan" && Array.isArray(frame.entries)) {
+      // Keep the last plan frame; grok revises it as it works.
+      plan = frame.entries as Record<string, unknown>[];
+    } else if (frame.type === "end") stopReason = String(frame.stopReason ?? "");
+    else if (frame.type === "error") failure = String(frame.error ?? "grok reported an error");
   }
+
+  if (plan?.length && ctx) {
+    const { writeTodos } = await import("./todos.server");
+    writeTodos(
+      ctx.conversationId,
+      ctx.actor,
+      plan.map((e) => ({ text: String(e.content ?? e.text ?? ""), status: e.status })),
+    );
+    logEvent({
+      kind: "tool:end",
+      actor: ctx.actor,
+      conversationId: ctx.conversationId,
+      message: `published a ${plan.length}-step plan`,
+    });
+  }
+
+  const answer = text.trim();
+  if (answer) return answer;
+  if (failure) throw new Error(failure);
+  throw new Error(
+    stopReason === "cancelled"
+      ? "grok stopped before answering (hit its turn limit)."
+      : "grok returned an empty reply.",
+  );
 }
 
 /** Codex approval methods, and how each names the thing being approved. */
@@ -567,25 +768,72 @@ const CODEX_APPROVAL_METHODS = new Set([
  * another (no cross-session memory), so "always" answers `acceptForSession`
  * here and is remembered on our side for the next session instead.
  */
+/**
+ * What a streamed Codex item is about, so an approval can name it.
+ *
+ * The approval request itself carries only ids — measured: an
+ * `item/fileChange/requestApproval` arrives as `{threadId, turnId, itemId,
+ * startedAtMs, reason: null}`. The paths and the diff came earlier, on
+ * `item/started`. Without joining the two, the human is asked to approve
+ * "codex:file_change" with nothing to judge it by.
+ */
+type CodexItemFacts = { command?: string; path?: string; content?: string };
+
+export function codexItemFacts(item: Record<string, unknown> | undefined): CodexItemFacts | null {
+  if (!item || typeof item !== "object") return null;
+  const type = item.type;
+
+  if (type === "fileChange" && Array.isArray(item.changes)) {
+    const changes = item.changes as { path?: string; kind?: { type?: string }; diff?: string }[];
+    const paths = changes.map((c) => c.path).filter((x): x is string => typeof x === "string");
+    if (!paths.length) return null;
+    const label =
+      paths.length === 1
+        ? paths[0]
+        : `${paths.length} files: ${paths.map((x) => x.split("/").pop()).join(", ")}`;
+    return { path: label, content: changes.map((c) => c.diff ?? "").join("") };
+  }
+
+  if (type === "commandExecution" && typeof item.command === "string") {
+    return { command: item.command };
+  }
+
+  return null;
+}
+
 async function codexApprovalDecision(
   ctx: ToolContext,
   method: string,
   params: Record<string, unknown> | undefined,
+  items?: Map<string, CodexItemFacts>,
 ): Promise<string> {
   const { requestApproval } = await import("./approvals.server");
-  const command = typeof params?.command === "string" ? params.command : "";
+  const itemId = typeof params?.itemId === "string" ? params.itemId : "";
+  const facts = (itemId && items?.get(itemId)) || {};
+  const command = typeof params?.command === "string" ? params.command : (facts.command ?? "");
   const reasonField = typeof params?.reason === "string" ? params.reason : "";
   const isFileChange = method.includes("fileChange") || method === "applyPatchApproval";
+
+  const args: Record<string, unknown> = {};
+  if (command) args.command = command;
+  if (facts.path) args.path = facts.path;
+  if (facts.content) args.content = facts.content;
 
   const outcome = await requestApproval({
     userId: ctx.userId,
     conversationId: ctx.conversationId,
     actor: ctx.actor,
     tool: isFileChange ? "codex:file_change" : "codex:run_command",
-    args: command ? { command } : {},
+    args,
     reason:
       reasonField ||
-      (command ? `Run: ${command.slice(0, 200)}` : isFileChange ? "Apply file changes in your workspace" : "Run a tool"),
+      (command
+        ? `Run: ${command.slice(0, 200)}`
+        : facts.path
+          ? `Write ${facts.path}`
+          : isFileChange
+            ? "Apply file changes in your workspace"
+            : "Run a tool"),
   });
 
   if (!outcome.allowed) return "decline"; // the turn continues without it
@@ -657,6 +905,10 @@ export async function completeWithCodexCli(
     stderr = `${stderr}${chunk.toString()}`.slice(-2000);
   });
 
+  // Item id -> what that item is about, filled as the turn streams. An approval
+  // request names only the id, so this is what lets the prompt say which file.
+  const codexItems = new Map<string, CodexItemFacts>();
+
   const finished = new Promise<string>((resolve, reject) => {
     let buffer = "";
     child.stdout.on("data", (chunk: Buffer) => {
@@ -690,13 +942,22 @@ export async function completeWithCodexCli(
         if (msg.id != null && msg.method) {
           const id = msg.id;
           if (ctx && CODEX_APPROVAL_METHODS.has(msg.method)) {
-            void codexApprovalDecision(ctx, msg.method, msg.params)
+            void codexApprovalDecision(ctx, msg.method, msg.params, codexItems)
               .then((decision) => send({ jsonrpc: "2.0", id, result: { decision } }))
               .catch(() => send({ jsonrpc: "2.0", id, result: { decision: "decline" } }));
             continue;
           }
           send({ jsonrpc: "2.0", id, error: { code: -32601, message: "no interactive client" } });
           continue;
+        }
+
+        // Remember what each item is about; an approval for it arrives later
+        // carrying nothing but its id.
+        if (msg.method === "item/started" || msg.method === "item/updated") {
+          const item = msg.params?.item as Record<string, unknown> | undefined;
+          const id = typeof item?.id === "string" ? item.id : "";
+          const facts = codexItemFacts(item);
+          if (id && facts) codexItems.set(id, facts);
         }
 
         if (msg.method === "turn/plan/updated" && ctx) {

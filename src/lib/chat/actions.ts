@@ -202,6 +202,24 @@ export const deleteConversation = createServerFn({ method: "POST" })
     await sql`delete from messages where conversation_id = ${id} and user_id = ${context.userId}`;
     await sql`delete from conversation_agents where conversation_id = ${id} and user_id = ${context.userId}`;
     await sql`delete from conversations where id = ${id} and user_id = ${context.userId}`;
+
+    // The rows cascade; the memory does not. A turn parked on an approval or a
+    // question would otherwise wait out its timeout for an answer that can no
+    // longer be given, and the room's plan and its session grants would sit in
+    // this process for as long as it runs.
+    const { abandonConversation } = await import("./approvals.server");
+    const { abandonQuestions } = await import("./questions.server");
+    const { clearTodos } = await import("./todos.server");
+    const { logEvent } = await import("@/lib/log.server");
+    const released = abandonConversation(id) + abandonQuestions(id);
+    clearTodos(id);
+    if (released) {
+      logEvent({
+        kind: "tool:error",
+        conversationId: id,
+        message: `chamber deleted; released ${released} unanswerable prompt(s)`,
+      });
+    }
     return { ok: true as const };
   });
 

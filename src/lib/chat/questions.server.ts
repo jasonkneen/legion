@@ -54,6 +54,25 @@ export function pendingQuestions(conversationId?: string): PendingQuestion[] {
   return conversationId ? all.filter((q) => q.conversationId === conversationId) : all;
 }
 
+/**
+ * Dismiss every question a deleted chamber was waiting on.
+ *
+ * Same reasoning as the approvals: the form lived in a chat that no longer
+ * exists, so nobody can answer it. A dismissal is what the seat would have seen
+ * had the human closed the form, which it already handles.
+ */
+export function abandonQuestions(conversationId: string): number {
+  let released = 0;
+  for (const [id, waiter] of [...waiting().entries()]) {
+    if (waiter.pending.conversationId !== conversationId) continue;
+    waiting().delete(id);
+    clearTimeout(waiter.timer);
+    waiter.resolve(null);
+    released += 1;
+  }
+  return released;
+}
+
 /** Deliver the human's answers, or null when they dismissed the form. */
 export function answerQuestion(id: string, answers: QuestionAnswers | null): boolean {
   const waiter = waiting().get(id);

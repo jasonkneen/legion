@@ -58,7 +58,7 @@ export function ApprovalPanel({
           disabled={busy !== null}
           onClick={() => void choose("session")}
         >
-          Allow for this chat
+          {request.perCommand ? "Allow this command here" : "Allow for this chat"}
         </Button>
         <Button
           type="button"
@@ -67,7 +67,7 @@ export function ApprovalPanel({
           disabled={busy !== null}
           onClick={() => void choose("always")}
         >
-          Always allow
+          {request.perCommand ? "Always allow this command" : "Always allow"}
         </Button>
         <div className="flex-1" />
         <Button

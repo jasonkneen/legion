@@ -178,6 +178,79 @@
   }
 }
 
+/*
+ * The composer dock.
+ *
+ * The queue, approvals, questions, plan and activity panels all appear
+ * directly above the input. Rendered as separate rounded cards they read as
+ * floating pills stacked on the composer; joined into one bordered surface
+ * they read as a drawer that opens out of it. The panels keep their own
+ * markup — the dock flattens their border and radius from the outside, so no
+ * component needs to know whether it is docked.
+ */
+.composer-dock {
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  background: var(--bg-elevated);
+  box-shadow: var(--shadow-composer);
+  /*
+   * Deliberately not `overflow: hidden`. The @mention autocomplete renders
+   * above the input and therefore outside this box; clipping the dock would
+   * cut it in half. The corners are rounded on the edge children instead.
+   */
+}
+
+/* Inner radius is the outer radius less the 1px border, or it looks off-centre. */
+.composer-dock > *:first-child,
+.composer-dock > *:first-child > .composer-box {
+  border-top-left-radius: calc(var(--radius-md) - 1px);
+  border-top-right-radius: calc(var(--radius-md) - 1px);
+}
+
+.composer-dock .composer-box {
+  border-bottom-left-radius: calc(var(--radius-md) - 1px);
+  border-bottom-right-radius: calc(var(--radius-md) - 1px);
+}
+
+.composer-dock > * {
+  margin-bottom: 0;
+}
+
+/* Everything above the input: square, divided, no shadow of its own. */
+.composer-dock > *:not(:last-child) {
+  border-width: 0 0 1px 0;
+  box-shadow: none;
+  animation: drawer-open 160ms ease-out;
+}
+
+/* Square where panels meet each other and the input. */
+.composer-dock > *:not(:first-child) {
+  border-top-left-radius: 0;
+  border-top-right-radius: 0;
+}
+
+.composer-dock > *:not(:last-child) {
+  border-bottom-left-radius: 0;
+  border-bottom-right-radius: 0;
+}
+
+/* The input itself carries the dock's border instead of its own. */
+.composer-dock .composer-box {
+  border: 0;
+  box-shadow: none;
+}
+
+@keyframes drawer-open {
+  from {
+    opacity: 0;
+    transform: translateY(4px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
 @keyframes lumen-dots {
   0%,
   80%,

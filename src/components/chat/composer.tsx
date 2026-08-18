@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from "react";
-import { ArrowUp, Mic, Plus, X } from "lucide-react";
+import { ArrowUp, Mic, Plus, Square, X } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { SeatAvatar } from "@/components/seat-avatar";
 import { splitMentionQuery } from "@/lib/chat/mentions";
@@ -14,6 +14,7 @@ export function Composer({
   replyTo,
   onClearReply,
   onSend,
+  onStop,
   onAddSeat,
 }: {
   seats: Seat[];
@@ -25,6 +26,8 @@ export function Composer({
   replyTo?: { handle: string; excerpt: string } | null;
   onClearReply?: () => void;
   onSend: (text: string, askAll: boolean) => void;
+  /** Interrupt the seat that is currently answering. */
+  onStop?: () => void;
   onAddSeat?: () => void;
 }) {
   const [value, setValue] = useState("");
@@ -165,7 +168,7 @@ export function Composer({
         </div>
       )}
 
-      <div className="rounded-xl border border-border bg-bg-elevated shadow-composer">
+      <div className="composer-box rounded-md border border-border bg-bg-elevated shadow-composer">
         <textarea
           ref={areaRef}
           rows={1}
@@ -234,16 +237,29 @@ export function Composer({
               Ask all
             </button>
           </div>
-          <Button
-            type="button"
-            size="icon-sm"
-            onClick={submit}
-            disabled={disabled || !value.trim()}
-            aria-label={queueing ? "Add to queue" : "Send"}
-            className="rounded-full"
-          >
-            <ArrowUp />
-          </Button>
+          {queueing && onStop ? (
+            <Button
+              type="button"
+              size="icon-sm"
+              variant="secondary"
+              onClick={onStop}
+              aria-label="Stop the current reply"
+              className="rounded-full"
+            >
+              <Square className="size-3 fill-current" />
+            </Button>
+          ) : (
+            <Button
+              type="button"
+              size="icon-sm"
+              onClick={submit}
+              disabled={disabled || !value.trim()}
+              aria-label={queueing ? "Add to queue" : "Send"}
+              className="rounded-full"
+            >
+              <ArrowUp />
+            </Button>
+          )}
         </div>
       </div>
     </div>

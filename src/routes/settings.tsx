@@ -4,6 +4,7 @@ import { Blocks, KeyRound, Plug, Server, Users } from "lucide-react";
 import { AppShell } from "@/components/app-shell";
 import { AssistantsPanel } from "@/components/assistants-panel";
 import { AccountsPanel } from "@/components/accounts-panel";
+import { StandingApprovals } from "@/components/settings/standing-approvals";
 import { McpPanel } from "@/components/mcp-panel";
 import { CapabilitiesPanel } from "@/components/capabilities-panel";
 import { KeysPanel } from "@/components/keys-panel";
@@ -103,6 +104,7 @@ function SettingsPage() {
 
             {section === "tools" && (
               <div className="mt-6 space-y-4">
+                <StandingApprovals />
                 <McpPanel />
                 <CapabilitiesPanel />
               </div>

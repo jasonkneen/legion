@@ -1,4 +1,4 @@
-import { MoreHorizontal, Reply } from "lucide-react";
+import { MoreHorizontal, Reply, RotateCw } from "lucide-react";
 import { RichText } from "@/components/markdown";
 import { SeatAvatar } from "@/components/seat-avatar";
 import {
@@ -35,6 +35,7 @@ export function MessageItem({
   streaming,
   onAsk,
   onReply,
+  onRetry,
 }: {
   message: ChatMessage;
   seat?: Seat;
@@ -43,10 +44,24 @@ export function MessageItem({
   onAsk?: (handle: string, task: string, prompt: string) => void;
   /** Start a reply addressed at this message's author. */
   onReply?: (message: ChatMessage, seat?: Seat) => void;
+  /** Run the failed turn again. Only passed for turns that can be retried. */
+  onRetry?: () => void;
 }) {
   if (message.authorType === "system") {
     return (
-      <div className="mx-auto max-w-2xl px-1 py-2 text-center text-xs text-fg-subtle">{message.content}</div>
+      <div className="mx-auto max-w-2xl px-1 py-2 text-center text-xs text-fg-subtle">
+        {message.content}
+        {onRetry && (
+          <button
+            type="button"
+            onClick={onRetry}
+            className="ml-2 inline-flex items-center gap-1 rounded-md px-1.5 py-0.5 font-medium text-fg-muted underline-offset-2 hover:bg-bg-subtle hover:underline"
+          >
+            <RotateCw className="size-3" />
+            Try again
+          </button>
+        )}
+      </div>
     );
   }
 

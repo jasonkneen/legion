@@ -1,11 +1,7 @@
-import { useEffect, useState } from "react";
+import { useState } from "react";
 import { Bot, ChevronDown, ChevronUp, FileDiff, Terminal, Wrench, Zap } from "lucide-react";
-import {
-  getFileDiff,
-  listActivity,
-  listWorkspaceChanges,
-  type ActivityEvent,
-} from "@/lib/chat/activity-actions";
+import { getFileDiff, type ActivityEvent } from "@/lib/chat/activity-actions";
+import { usePulse } from "@/lib/chat/use-pulse";
 import type { FileChange } from "@/lib/chat/tools.server";
 import { cn } from "@/lib/utils";
 
@@ -37,35 +33,17 @@ function ms(value?: number): string {
  */
 export function ActivityPanel({ conversationId, live }: { conversationId: string; live: boolean }) {
   const [open, setOpen] = useState(false);
-  const [events, setEvents] = useState<ActivityEvent[]>([]);
-  const [changes, setChanges] = useState<FileChange[]>([]);
   // Diffs are fetched per file on demand: a session can touch dozens, and
   // nobody wants every patch streamed into a poll.
   const [openDiff, setOpenDiff] = useState<{ path: string; patch: string } | null>(null);
 
-  useEffect(() => {
-    if (!open && !live) return;
-    let stopped = false;
-    const poll = () => {
-      void listActivity({ data: conversationId })
-        .then((rows) => {
-          if (!stopped) setEvents(rows);
-        })
-        .catch(() => undefined);
-      void listWorkspaceChanges()
-        .then((rows) => {
-          if (!stopped) setChanges(rows);
-        })
-        .catch(() => undefined);
-    };
-    poll();
-    // Slower than the approval poll: nothing here blocks a turn.
-    const timer = window.setInterval(poll, live ? 2500 : 8000);
-    return () => {
-      stopped = true;
-      window.clearInterval(timer);
-    };
-  }, [open, live, conversationId]);
+  // Both of these are expensive — the file list shells out to git — so they are
+  // fetched only while this panel is showing them or a turn is running, and on
+  // the chamber's single shared poll rather than a timer of this panel's own.
+  const wanted = open || live;
+  const pulse = usePulse(conversationId, live, { activity: wanted, changes: wanted });
+  const events: ActivityEvent[] = pulse?.activity ?? [];
+  const changes: FileChange[] = pulse?.changes ?? [];
 
   const toolRuns = events.filter((e) => e.kind === "tool:end" || e.kind === "tool:error");
   const subagents = events.filter((e) => e.actor.endsWith(":subagent") && e.kind === "cli:spawn");

@@ -1,6 +1,7 @@
-import { useEffect, useState } from "react";
+import { useState } from "react";
 import { Circle, CircleCheck, CircleDot, ListTodo } from "lucide-react";
-import { listConversationTodos, setTodoStatus } from "@/lib/chat/todo-actions";
+import { setTodoStatus } from "@/lib/chat/todo-actions";
+import { usePulse } from "@/lib/chat/use-pulse";
 import type { TodoItem, TodoStatus } from "@/lib/chat/todos.server";
 import { cn } from "@/lib/utils";
 
@@ -25,24 +26,14 @@ const ICON: Record<TodoStatus, typeof Circle> = {
  * not a plan.
  */
 export function TodoPanel({ conversationId, live }: { conversationId: string; live: boolean }) {
-  const [items, setItems] = useState<TodoItem[]>([]);
-
-  useEffect(() => {
-    let stopped = false;
-    const poll = () => {
-      void listConversationTodos({ data: conversationId })
-        .then((rows) => {
-          if (!stopped) setItems(rows);
-        })
-        .catch(() => undefined);
-    };
-    poll();
-    const timer = window.setInterval(poll, live ? 2500 : 10_000);
-    return () => {
-      stopped = true;
-      window.clearInterval(timer);
-    };
-  }, [conversationId, live]);
+  // The plan rides the chamber's shared poll rather than a timer of its own.
+  const rows: TodoItem[] = usePulse(conversationId, live)?.todos ?? [];
+  // A tick should look instant even though the next poll may be seconds away.
+  // The override drops out as soon as the server agrees.
+  const [optimistic, setOptimistic] = useState<Record<string, TodoStatus>>({});
+  const items: TodoItem[] = rows.map((t) =>
+    optimistic[t.id] && optimistic[t.id] !== t.status ? { ...t, status: optimistic[t.id] } : t,
+  );
 
   if (items.length === 0) return null;
 
@@ -64,13 +55,11 @@ export function TodoPanel({ conversationId, live }: { conversationId: string; li
               <button
                 type="button"
                 onClick={() =>
-                  void setTodoStatus({
-                    data: { conversationId, id: item.id, status: NEXT[item.status] },
-                  }).then(() =>
-                    setItems((prev) =>
-                      prev.map((t) => (t.id === item.id ? { ...t, status: NEXT[item.status] } : t)),
-                    ),
-                  )
+                  {
+                    const next = NEXT[item.status];
+                    setOptimistic((prev) => ({ ...prev, [item.id]: next }));
+                    void setTodoStatus({ data: { conversationId, id: item.id, status: next } });
+                  }
                 }
                 className="flex w-full items-start gap-2 rounded-md px-1.5 py-1 text-left hover:bg-bg-subtle"
               >
