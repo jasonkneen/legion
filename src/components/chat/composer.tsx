@@ -2,9 +2,43 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import { ArrowUp, Mic, Plus, Square, X } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { SeatAvatar } from "@/components/seat-avatar";
-import { splitMentionQuery } from "@/lib/chat/mentions";
+import { splitMentionQuery, spokenMentions } from "@/lib/chat/mentions";
 import type { Seat } from "@/lib/chat/types";
 import { cn } from "@/lib/utils";
+
+/**
+ * A live level meter while dictating.
+ *
+ * It reads from the recogniser's own results rather than opening a second audio
+ * stream: two consumers of one microphone is a good way to have neither work,
+ * and what the human needs to know is "is it hearing me", which arriving
+ * transcript answers exactly.
+ */
+function RecordingLevel({ heardAt }: { heardAt: number }) {
+  const [now, setNow] = useState(Date.now());
+  useEffect(() => {
+    const timer = window.setInterval(() => setNow(Date.now()), 120);
+    return () => window.clearInterval(timer);
+  }, []);
+  const speaking = now - heardAt < 900;
+  return (
+    <span className="flex items-center gap-1.5 pl-0.5 text-xs text-danger" aria-live="polite">
+      <span className="flex items-end gap-[2px]" aria-hidden>
+        {[0, 1, 2].map((i) => (
+          <span
+            key={i}
+            className={cn(
+              "w-[2px] rounded-full bg-danger transition-all duration-150",
+              speaking ? "animate-pulse" : "opacity-50",
+            )}
+            style={{ height: speaking ? `${5 + ((i + (now % 3)) % 3) * 4}px` : "4px" }}
+          />
+        ))}
+      </span>
+      {speaking ? "listening" : "recording"}
+    </span>
+  );
+}
 
 export function Composer({
   seats,
@@ -34,6 +68,8 @@ export function Composer({
   const [askAll, setAskAll] = useState(false);
   const [mentionIndex, setMentionIndex] = useState(0);
   const [listening, setListening] = useState(false);
+  /** When speech last arrived, so the indicator can show it is hearing us. */
+  const [heardAt, setHeardAt] = useState(0);
   const areaRef = useRef<HTMLTextAreaElement>(null);
   const recognitionRef = useRef<SpeechRecognitionLike | null>(null);
 
@@ -95,6 +131,7 @@ export function Composer({
     if (listening) {
       recognitionRef.current?.stop();
       setListening(false);
+      setHeardAt(0);
       return;
     }
     const Ctor = speechRecognitionCtor();
@@ -111,7 +148,8 @@ export function Composer({
       for (let i = event.resultIndex; i < event.results.length; i += 1) {
         heard += event.results[i][0]?.transcript ?? "";
       }
-      setValue(`${base}${heard}`.slice(0, 8000));
+      setHeardAt(Date.now());
+      setValue(`${base}${spokenMentions(heard, seats)}`.slice(0, 8000));
     };
     recognition.onerror = () => setListening(false);
     recognition.onend = () => setListening(false);
@@ -221,11 +259,18 @@ export function Composer({
                 size="icon-sm"
                 onClick={toggleDictation}
                 aria-label={listening ? "Stop dictation" : "Dictate"}
-                className={cn(listening && "text-accent")}
+                className={cn("relative", listening && "text-danger")}
               >
                 <Mic />
+                {listening && (
+                  // A red dot on the microphone, the way every recorder marks
+                  // that it is live. Without it the only sign was a tinted icon,
+                  // which is not enough to be sure your machine is listening.
+                  <span className="absolute top-0.5 right-0.5 size-1.5 animate-pulse rounded-full bg-danger" />
+                )}
               </Button>
             )}
+            {listening && <RecordingLevel heardAt={heardAt} />}
             <button
               type="button"
               onClick={() => setAskAll((v) => !v)}

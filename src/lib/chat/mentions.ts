@@ -27,3 +27,21 @@ export function splitMentionQuery(value: string, caret: number): {
   if (/\s/.test(query)) return { active: false, start: -1, query: "" };
   return { active: true, start: at, query };
 }
+
+/**
+ * Turn spoken mentions into real ones while dictation is running.
+ *
+ * Nobody says "at sign grok" — they say "at grok", and speech recognition
+ * writes it as words. Left alone the message reads "AT grok, take a look",
+ * addresses nobody, and the turn goes to whoever happens to be first. Matching
+ * against the seated handles keeps it honest: "at" only becomes "@" when a real
+ * seat follows it.
+ */
+export function spokenMentions(text: string, seats: { handle: string }[]): string {
+  if (!seats.length) return text;
+  const handles = seats.map((s) => s.handle.toLowerCase());
+  return text.replace(/\b(at|@)\s+([a-z][\w-]*)/gi, (whole, _at, word: string) => {
+    const match = handles.find((h) => h === word.toLowerCase());
+    return match ? `@${match}` : whole;
+  });
+}

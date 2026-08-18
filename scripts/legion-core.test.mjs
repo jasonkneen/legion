@@ -611,6 +611,37 @@ describe("pi and hermes keep their own tools, not their own writers", () => {
   });
 });
 
+describe("dictated mentions", () => {
+  test("hears \"at grok\" as @grok", async () => {
+    const { spokenMentions } = await server.ssrLoadModule("/src/lib/chat/mentions.ts");
+    const seats = [{ handle: "grok" }, { handle: "claude" }];
+    // Nobody says "at sign grok"; speech recognition writes the words, and the
+    // message then addresses nobody and goes to whoever happens to be first.
+    assert.equal(spokenMentions("at grok take a look", seats), "@grok take a look");
+    assert.equal(spokenMentions("At Claude what do you think", seats), "@claude what do you think");
+  });
+
+  test("leaves ordinary uses of the word alone", async () => {
+    const { spokenMentions } = await server.ssrLoadModule("/src/lib/chat/mentions.ts");
+    const seats = [{ handle: "grok" }];
+    // The risk of a blanket rule: most sentences with "at" in them are not
+    // addressing anyone, so only a real seat name may trigger it.
+    assert.equal(spokenMentions("look at the deploy logs", seats), "look at the deploy logs");
+    assert.equal(spokenMentions("at the moment nothing works", seats), "at the moment nothing works");
+    assert.equal(spokenMentions("meet at noon", seats), "meet at noon");
+  });
+
+  test("does not double up on a mention that is already typed", async () => {
+    const { spokenMentions } = await server.ssrLoadModule("/src/lib/chat/mentions.ts");
+    assert.equal(spokenMentions("@grok hello", [{ handle: "grok" }]), "@grok hello");
+  });
+
+  test("with no seats, nothing is a mention", async () => {
+    const { spokenMentions } = await server.ssrLoadModule("/src/lib/chat/mentions.ts");
+    assert.equal(spokenMentions("at grok hello", []), "at grok hello");
+  });
+});
+
 describe("question parsing", () => {
   test("accepts a bare object instead of an array", () => {
     const parsed = questions.parseQuestions({
