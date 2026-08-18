@@ -1,7 +1,7 @@
 import { useState } from "react";
 import { useNavigate } from "@tanstack/react-router";
 import { toast } from "sonner";
-import { SeatAvatar } from "@/components/seat-avatar";
+import { SEAT_STACK_EDGE, SeatAvatar } from "@/components/seat-avatar";
 import { BrandMark } from "@/components/brand";
 import { Button } from "@/components/ui/button";
 import { createConversation } from "@/lib/chat/actions";
@@ -67,7 +67,7 @@ export function EmptyChamber() {
             >
               <div className="flex -space-x-1.5">
                 {preset.seats.map((s) => (
-                  <SeatAvatar key={s.handle} modelId={s.modelId} name={s.name} size="sm" className="ring-2 ring-bg-elevated" />
+                  <SeatAvatar key={s.handle} modelId={s.modelId} name={s.name} size="sm" className={SEAT_STACK_EDGE} />
                 ))}
               </div>
               <div className="mt-3 text-sm font-medium">{preset.label}</div>

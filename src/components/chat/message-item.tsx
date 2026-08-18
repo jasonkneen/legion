@@ -80,7 +80,7 @@ export function MessageItem({
   return (
     <article className="mx-auto w-full max-w-2xl px-1 py-4">
       <header className="mb-2 flex items-center gap-2">
-        <SeatAvatar modelId={seat?.modelId ?? "grok-4.6"} name={seat?.displayName ?? "Seat"} size="sm" />
+        <SeatAvatar modelId={seat?.modelId ?? "grok-4.6"} name={seat?.displayName ?? "Seat"} size="sm" working={streaming} />
         <div className="min-w-0 flex-1">
           <div className="flex flex-wrap items-baseline gap-x-2">
             <span className="text-sm font-medium">{seat?.displayName ?? "Seat"}</span>

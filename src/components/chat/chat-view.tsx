@@ -463,6 +463,7 @@ export function ChatView({
         </div>
         <SeatRail
           seats={seats}
+          workingHandle={workingHandle}
           missingHandles={new Set(missingSeats.map((s) => s.handle))}
           onAdd={() => setAddOpen(true)}
           onRemove={(seat) => {
@@ -565,7 +566,7 @@ export function ChatView({
         {workingSeat && (
           <article className="mx-auto w-full max-w-2xl px-1 py-4">
             <header className="mb-2 flex items-center gap-2">
-              <SeatAvatar modelId={workingSeat.modelId} name={workingSeat.displayName} size="sm" />
+              <SeatAvatar modelId={workingSeat.modelId} name={workingSeat.displayName} size="sm" working />
               <div className="min-w-0">
                 <span className="text-sm font-medium">{workingSeat.displayName}</span>
                 <span className="ml-2 text-xs text-fg-subtle">@{workingSeat.handle}</span>

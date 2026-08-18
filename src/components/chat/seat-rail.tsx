@@ -17,12 +17,15 @@ import type { Seat } from "@/lib/chat/types";
 
 export function SeatRail({
   seats,
+  workingHandle,
   missingHandles,
   onAdd,
   onRemove,
   onAsk,
 }: {
   seats: Seat[];
+  /** The seat that is mid-turn, whose face should show it is working. */
+  workingHandle?: string | null;
   missingHandles?: Set<string>;
   onAdd: () => void;
   onRemove: (seat: Seat) => void;
@@ -55,7 +58,12 @@ export function SeatRail({
         return (
           <DropdownMenu key={seat.id}>
             <DropdownMenuTrigger className="relative flex items-center gap-1.5 rounded-full border border-border bg-bg-elevated py-1 pr-2.5 pl-1 hover:bg-bg-subtle">
-              <SeatAvatar modelId={seat.modelId} name={seat.displayName} size="sm" />
+              <SeatAvatar
+                modelId={seat.modelId}
+                name={seat.displayName}
+                size="sm"
+                working={seat.handle === workingHandle}
+              />
               <span className="text-xs font-medium whitespace-nowrap">{seat.displayName}</span>
               {missing && <span className="absolute top-0 right-0 size-2 rounded-full bg-danger" />}
             </DropdownMenuTrigger>

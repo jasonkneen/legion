@@ -4,7 +4,7 @@ import { useState } from "react";
 import { toast } from "sonner";
 import { AppShell } from "@/components/app-shell";
 import { AssistantEditor } from "@/components/assistant-editor";
-import { SeatAvatar } from "@/components/seat-avatar";
+import { SEAT_STACK_EDGE, SeatAvatar } from "@/components/seat-avatar";
 import { Button } from "@/components/ui/button";
 import {
   DropdownMenu,
@@ -204,7 +204,7 @@ function DiscoverPage() {
               >
                 <div className="flex -space-x-1.5">
                   {p.seats.map((s) => (
-                    <SeatAvatar key={s.handle} modelId={s.modelId} name={s.name} size="sm" className="ring-2 ring-bg-elevated" />
+                    <SeatAvatar key={s.handle} modelId={s.modelId} name={s.name} size="sm" className={SEAT_STACK_EDGE} />
                   ))}
                 </div>
                 <div className="mt-3 text-sm font-medium">{p.label}</div>

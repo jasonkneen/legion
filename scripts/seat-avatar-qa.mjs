@@ -28,12 +28,19 @@ await page.getByRole("button", { name: /Council/ }).first().click();
 await page.waitForURL(/\/c\//, { timeout: 30000 });
 await page.waitForTimeout(1800);
 
+// Animated blobatars are inline SVG rather than <img>, so identity is the
+// markup itself: same seat, same shapes.
 const srcs = await page.evaluate(() =>
-  Array.from(document.querySelectorAll("img"))
-    .map((i) => i.getAttribute("src") ?? "")
-    .filter((s) => s.startsWith("data:image/svg")),
+  Array.from(document.querySelectorAll("svg"))
+    .filter((el) => (el.getAttribute("class") ?? "").includes("mo-") || el.querySelector("ellipse,path"))
+    .map((el) => el.innerHTML)
+    .filter((h) => h.length > 40),
 );
-console.log(`blobatar images on screen: ${srcs.length}`);
+console.log(`blobatar faces on screen: ${srcs.length}`);
+const backdrops = await page.evaluate(() =>
+  Array.from(document.querySelectorAll("svg")).filter((el) => el.querySelector("[data-bg]")).length,
+);
+console.log(`faces still drawing a backdrop plate: ${backdrops}`);
 console.log(`distinct faces: ${new Set(srcs).size}`);
 
 // The same seat, in the rail and on its messages, must be the same face.
